@@ -1,0 +1,22 @@
+# Chrome profiles riêng của app (chứa session, cookies — không commit)
+.chrome_profile/
+.chrome_profiles/
+.accounts.json
+
+# Project ID do app tự tạo và quản lý
+.flow_project.json
+
+# Virtual environment
+.venv/
+
+# Output images
+outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Env file
+.env
