@@ -1,14 +1,27 @@
 # Hướng Dẫn Tích Hợp Dịch Vụ Tạo Ảnh (Dành Cho Ứng Dụng Khác)
 
-Service tạo ảnh từ Google Flow đang chạy ngầm độc lập tại:
+Service tạo ảnh từ **Google Flow** và **Gemini Chat** đang chạy ngầm độc lập tại:
 - **Base URL**: `http://localhost:8080`
 - **Swagger Docs**: `http://localhost:8080/docs`
 
 ---
 
-## 1. Phân Vùng Project Theo Từng Ứng Dụng (`app_name`)
+## 1. Tính Năng Đa Nhà Cung Cấp (`provider` / `nha_cung_cap`)
 
-Dịch vụ hỗ trợ **tự động tách riêng mỗi ứng dụng một Project độc lập trên Google Flow**:
+Hệ thống hỗ trợ 2 nhà cung cấp AI tạo ảnh mạnh mẽ, chạy trong **CÙNG một phiên trình duyệt Chrome (chung session & cookies Google, không cần nạp lại thông tin đăng nhập)**:
+
+| Provider | Giá trị tham số | Mô tả & Điểm mạnh |
+| :--- | :--- | :--- |
+| **Google Flow** | `"flow"` (Mặc định) | Phân vùng theo từng Project (`app_name`), hỗ trợ tải ảnh mẫu phong cách, chọn khung hình chính xác qua menu. |
+| **Gemini Chat** | `"gemini"` | Dùng mô hình **Imagen 3** trên `gemini.google.com`, tải ảnh gốc độ phân giải cao (=s0), hỗ trợ ảnh tham chiếu. |
+
+Bạn có thể truyền `"provider": "flow"` hoặc `"provider": "gemini"` (hoặc alias tiếng Việt `"nha_cung_cap": "gemini"`).
+
+---
+
+## 2. Phân Vùng Project Theo Từng Ứng Dụng (`app_name`)
+
+Đối với Google Flow, dịch vụ hỗ trợ **tự động tách riêng mỗi ứng dụng một Project độc lập**:
 - Mỗi khi app gửi request kèm thông số `app_name` (ví dụ: `"AppTruyenTranh"`, `"AppStory"`, `"AppMarketing"`):
   - Hệ thống sẽ tự động kiểm tra xem app đó đã có Project riêng trên Flow chưa.
   - **Nếu chưa có**: Tự động bấm "Dự án mới" trên flow.google.com để tạo một Project riêng cho app đó và lưu lại URL.
@@ -18,15 +31,27 @@ Dịch vụ hỗ trợ **tự động tách riêng mỗi ứng dụng một Proj
 
 ---
 
-## 2. Đặc tả API
+## 3. Đặc tả API
 
 ### Cách 1: Gọi JSON (`POST /api/v1/generate`)
 
 Hỗ trợ cả prompt thuần túy và prompt **kèm ảnh tham chiếu** (qua URL web, Base64 hoặc đường dẫn file cục bộ).
 
-#### A. Gửi danh sách kèm ảnh tham chiếu và app_name riêng cho từng prompt:
+#### A. Chọn Provider Gemini Chat:
 ```json
 {
+  "provider": "gemini",
+  "prompts": [
+    "Một cô gái Việt Nam duyên dáng mặc áo dài trắng bên hồ sen, phong cách chân thực 4k"
+  ],
+  "aspect_ratio": "9:16"
+}
+```
+
+#### B. Gửi danh sách kèm ảnh tham chiếu và app_name riêng cho từng prompt trên Flow:
+```json
+{
+  "provider": "flow",
   "app_name": "AppTruyenTranh",
   "items": [
     {
@@ -43,9 +68,10 @@ Hỗ trợ cả prompt thuần túy và prompt **kèm ảnh tham chiếu** (qua 
 }
 ```
 
-#### B. Gửi 1 ảnh tham chiếu chung cho nhiều prompt:
+#### C. Gửi 1 ảnh tham chiếu chung cho nhiều prompt:
 ```json
 {
+  "provider": "flow",
   "app_name": "AppVideoShorts",
   "prompts": [
     "Cảnh 1: Nhân vật đang đi dạo trên đường phố Tokyo",
@@ -55,13 +81,11 @@ Hỗ trợ cả prompt thuần túy và prompt **kèm ảnh tham chiếu** (qua 
   "aspect_ratio": "9:16"
 }
 ```
-  "aspect_ratio": "9:16"
-}
-```
 
-#### C. Gửi prompt thuần (không kèm ảnh tham chiếu):
+#### D. Gửi prompt thuần (không kèm ảnh tham chiếu):
 ```json
 {
+  "provider": "gemini",
   "prompts": [
     "A cute red panda sitting on a tree branch, 4k"
   ],

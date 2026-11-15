@@ -27,10 +27,17 @@ CHROME_EXECUTABLE: str = os.getenv(
 # Giữ False để tránh bị Google block bot-detection.
 HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
 
+# ─── Providers ──────────────────────────────────────────────────────────────────
+# Nhà cung cấp mặc định: "flow" (Google Flow) hoặc "gemini" (Gemini Chat)
+DEFAULT_PROVIDER: str = os.getenv("DEFAULT_PROVIDER", "flow").lower()
+
 # ─── Google Flow ────────────────────────────────────────────────────────────────
 FLOW_URL: str = "https://flow.google.com"
 # Project URL được tự động tạo và lưu vào .flow_project.json
 # Không cần cấu hình thủ công.
+
+# ─── Gemini Chat ────────────────────────────────────────────────────────────────
+GEMINI_URL: str = "https://gemini.google.com/app"
 
 # Seconds to wait for the image to appear after clicking Generate
 IMAGE_GENERATION_TIMEOUT: int = int(os.getenv("IMAGE_GENERATION_TIMEOUT", "120"))

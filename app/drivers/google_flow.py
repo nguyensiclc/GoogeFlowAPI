@@ -84,10 +84,15 @@ class GoogleFlowDriver:
     - Mỗi lần generate: nhập prompt → submit → chờ ảnh → download.
     """
 
-    def __init__(self, user_data_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        user_data_dir: Optional[str] = None,
+        context: Optional[BrowserContext] = None,
+    ) -> None:
         self.user_data_dir: str = user_data_dir or config.CHROME_USER_DATA_DIR
         self._playwright: Optional[Playwright] = None
-        self._context: Optional[BrowserContext] = None
+        self._context: Optional[BrowserContext] = context
+        self._owns_context: bool = context is None
         self._page: Optional[Page] = None
         self._project_url: Optional[str] = None
         # Tỷ lệ đã chỉnh cho project hiện tại (để không mở Cài đặt mỗi ảnh)
@@ -97,32 +102,49 @@ class GoogleFlowDriver:
 
     async def start(self) -> None:
         logger.info("Starting GoogleFlowDriver with profile: %s …", self.user_data_dir)
-        self._playwright = await async_playwright().start()
+        if not self._context:
+            self._playwright = await async_playwright().start()
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=self.user_data_dir,
+                executable_path=config.CHROME_EXECUTABLE,
+                headless=config.HEADLESS,
+                args=[
+                    "--start-maximized",
+                    f"--profile-directory={config.CHROME_PROFILE}",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+                no_viewport=True,
+            )
 
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=self.user_data_dir,
-            executable_path=config.CHROME_EXECUTABLE,
-            headless=config.HEADLESS,
-            args=[
-                "--start-maximized",
-                f"--profile-directory={config.CHROME_PROFILE}",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            no_viewport=True,
-        )
-
-        pages = self._context.pages
-        self._page = pages[0] if pages else await self._context.new_page()
+        if not self._page or self._page.is_closed():
+            # Tìm xem có page nào đang mở Flow không
+            flow_pages = [p for p in self._context.pages if "flow.google" in p.url]
+            if flow_pages:
+                self._page = flow_pages[0]
+            elif self._context.pages and self._owns_context:
+                self._page = self._context.pages[0]
+            else:
+                self._page = await self._context.new_page()
 
         # Đảm bảo có project hợp lệ ngay khi start
         self._project_url = await self._ensure_project(self._page)
         logger.info("Driver ready. Project: %s", self._project_url)
 
     async def stop(self) -> None:
-        if self._context:
-            await self._context.close()
-        if self._playwright:
-            await self._playwright.stop()
+        if self._page and not self._page.is_closed():
+            try:
+                await self._page.close()
+            except Exception:
+                pass
+            self._page = None
+
+        if self._owns_context:
+            if self._context:
+                await self._context.close()
+                self._context = None
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
         logger.info("GoogleFlowDriver stopped.")
 
     async def __aenter__(self) -> "GoogleFlowDriver":

@@ -62,12 +62,24 @@ class TaskItemModel(BaseModel):
         None,
         description="Chỉ định trực tiếp URL project Flow cần dùng (tùy chọn)",
     )
+    provider: Optional[Literal["flow", "gemini"]] = Field(
+        None,
+        description="Nhà cung cấp tạo ảnh: 'flow' (Google Flow) hoặc 'gemini' (Gemini Chat)",
+        examples=["flow"],
+    )
+    nha_cung_cap: Optional[Literal["flow", "gemini"]] = Field(
+        None,
+        description="Bí danh tiếng Việt của provider: 'flow' hoặc 'gemini'",
+    )
 
     def get_aspect_ratio(self) -> Optional[str]:
         return self.aspect_ratio or self.khung_hinh or self.loai_khung_hinh
 
     def get_app_name(self) -> Optional[str]:
         return self.app_name or self.project_name
+
+    def get_provider(self) -> Optional[str]:
+        return self.provider or self.nha_cung_cap
 
 
 class GenerateRequest(BaseModel):
@@ -117,6 +129,15 @@ class GenerateRequest(BaseModel):
         default=None,
         description="Chỉ định trực tiếp URL project Flow cần dùng (tùy chọn)",
     )
+    provider: Optional[Literal["flow", "gemini"]] = Field(
+        default=None,
+        description="Nhà cung cấp tạo ảnh mặc định cho request này: 'flow' hoặc 'gemini'",
+        examples=["flow"],
+    )
+    nha_cung_cap: Optional[Literal["flow", "gemini"]] = Field(
+        default=None,
+        description="Bí danh tiếng Việt của provider: 'flow' hoặc 'gemini'",
+    )
 
     def get_aspect_ratio(self) -> Optional[str]:
         return self.aspect_ratio or self.khung_hinh or self.loai_khung_hinh
@@ -124,9 +145,13 @@ class GenerateRequest(BaseModel):
     def get_app_name(self) -> Optional[str]:
         return self.app_name or self.project_name
 
+    def get_provider(self) -> Optional[str]:
+        return self.provider or self.nha_cung_cap
+
 
 class ImageResult(BaseModel):
     prompt: str
+    provider: str | None = None
     file_path: str | None = None
     image_url: str | None = None
     base64: str | None = None
@@ -204,6 +229,7 @@ async def generate_images(
     common_ratio = body.get_aspect_ratio()
     common_app = body.get_app_name()
     common_project_url = body.project_url
+    common_provider = body.get_provider()
 
     # 1. Nếu truyền items chi tiết
     if body.items:
@@ -226,6 +252,7 @@ async def generate_images(
             ratio = it.get_aspect_ratio() or common_ratio
             app = it.get_app_name() or common_app
             p_url = it.project_url or common_project_url
+            prov = it.get_provider() or common_provider
             tasks.append(
                 TaskItem(
                     prompt=it.prompt,
@@ -233,6 +260,7 @@ async def generate_images(
                     aspect_ratio=ratio,
                     app_name=app,
                     project_url=p_url,
+                    provider=prov,
                 )
             )
 
@@ -257,6 +285,7 @@ async def generate_images(
                     aspect_ratio=common_ratio,
                     app_name=common_app,
                     project_url=common_project_url,
+                    provider=common_provider,
                 )
             )
 
@@ -281,6 +310,7 @@ async def generate_images(
         images.append(
             ImageResult(
                 prompt=r.prompt,
+                provider=r.provider,
                 file_path=file_path_str,
                 image_url=image_url,
                 base64=r.base64,
@@ -315,6 +345,12 @@ async def generate_with_file(
     app_name: Optional[str] = Form(None, description="Tên ứng dụng gọi API (tự động dùng project riêng)"),
     project_name: Optional[str] = Form(None, description="Bí danh của app_name"),
     project_url: Optional[str] = Form(None, description="URL project tùy chọn"),
+    provider: Optional[Literal["flow", "gemini"]] = Form(
+        None, description="Nhà cung cấp tạo ảnh: 'flow' hoặc 'gemini'"
+    ),
+    nha_cung_cap: Optional[Literal["flow", "gemini"]] = Form(
+        None, description="Bí danh tiếng Việt của provider"
+    ),
     request: Request = None,
     service=Depends(get_service),
 ):
@@ -329,12 +365,14 @@ async def generate_with_file(
 
     chosen_ratio = aspect_ratio or khung_hinh or loai_khung_hinh
     chosen_app = app_name or project_name
+    chosen_provider = provider or nha_cung_cap
     task = TaskItem(
         prompt=prompt,
         reference_images=[target_path.resolve()],
         aspect_ratio=chosen_ratio,
         app_name=chosen_app,
         project_url=project_url,
+        provider=chosen_provider,
     )
 
     try:
@@ -352,6 +390,7 @@ async def generate_with_file(
         images.append(
             ImageResult(
                 prompt=r.prompt,
+                provider=r.provider,
                 file_path=file_path_str,
                 image_url=image_url,
                 base64=r.base64,

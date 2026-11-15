@@ -1,11 +1,15 @@
-# Image Generation Service (Google Flow API)
+# Image Generation Service (Google Flow & Gemini Chat API)
 
-Dịch vụ REST API độc lập (FastAPI) nhận input là prompt tạo ảnh, tự động hóa thao tác trên **flow.google.com** qua Playwright, và trả về kết quả ảnh cho các ứng dụng khác kết nối.
+Dịch vụ REST API độc lập (FastAPI) nhận input là prompt tạo ảnh, tự động hóa thao tác trên **Google Flow (`flow.google.com`)** và **Gemini Chat (`gemini.google.com`)** qua Playwright, và trả về kết quả ảnh cho các ứng dụng khác kết nối. Cả 2 nhà cung cấp hoạt động trong **CÙNG MỘT PHIÊN TRÌNH DUYỆT CHROME (chung session & cookies Google, không cần nạp lại thông tin đăng nhập)**.
 
 ---
 
 ## 🌟 Tính năng chính
 
+- **Đa Nhà Cung Cấp AI (Multi-Provider)**:
+  - **Google Flow** (`provider: "flow"`): Tạo ảnh phân vùng theo từng Project (`app_name`), hỗ trợ tải ảnh mẫu phong cách, chọn khung hình qua menu.
+  - **Gemini Chat** (`provider: "gemini"`): Tạo ảnh bằng mô hình **Imagen 3** trên `gemini.google.com`, tải ảnh gốc độ phân giải cao (=s0).
+  - Cả 2 nhà cung cấp dùng chung một phiên Chrome đăng nhập Google duy nhất.
 - **API tập trung**: Nhận 1 hoặc một danh sách nhiều prompt (`list[str]`), sinh ảnh tuần tự, nhận bao nhiêu prompt trả về bấy nhiêu ảnh.
 - **Phân vùng Project tự động theo từng App (`app_name`)**: Mỗi ứng dụng gọi API truyền `app_name` (ví dụ `AppTruyenTranh`, `AppStory`) sẽ tự động được cấp và duy trì một Project riêng trên Google Flow mà không bị lẫn ảnh.
 - **Hỗ trợ ảnh tham chiếu (Reference Image)**: Nhận ảnh qua URL, Base64 hoặc upload file trực tiếp (`POST /api/v1/generate-with-file`).
