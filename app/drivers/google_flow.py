@@ -406,6 +406,8 @@ class GoogleFlowDriver:
         # 2. Nếu đã ở đúng project_url đó trên trình duyệt, không cần navigate lại
         if target_url and page.url.startswith(target_url):
             self._project_url = target_url
+            await self._close_side_panel_if_open(page)
+            await self._ensure_agent_mode_off(page)
             return target_url
 
         # 3. Nếu có target_url, kiểm tra và navigate
@@ -418,6 +420,8 @@ class GoogleFlowDriver:
                     self._project_url = page.url
                     if page.url != target_url:
                         ProjectStore.set_project(target_app, page.url)
+                    await self._close_side_panel_if_open(page)
+                    await self._ensure_agent_mode_off(page)
                     return self._project_url
                 logger.warning("Project [%s] không còn hợp lệ trên Flow — sẽ tự tạo project mới.", target_app)
             except Exception as e:
@@ -428,6 +432,8 @@ class GoogleFlowDriver:
         new_url = await self._create_new_project(page)
         ProjectStore.set_project(target_app, new_url)
         self._project_url = new_url
+        await self._close_side_panel_if_open(page)
+        await self._ensure_agent_mode_off(page)
         return new_url
 
     async def _ensure_project(self, page: Page) -> str:
@@ -487,31 +493,91 @@ class GoogleFlowDriver:
 
     # ── Aspect ratio (Loại khung hình) ───────────────────────────────────────
 
+    async def _close_side_panel_if_open(self, page: Page) -> None:
+        """Nếu panel trợ lý bên phải (Phiên không có tiêu đề) đang mở, đóng nó lại."""
+        try:
+            close_btn = page.locator("button:has-text('close'), button[aria-label*='Đóng' i], button[aria-label*='Close' i]").first
+            if await close_btn.count() > 0 and await close_btn.is_visible():
+                logger.info("Đóng side panel trợ lý của Flow …")
+                await close_btn.click()
+                await page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+    async def _ensure_agent_mode_off(self, page: Page) -> None:
+        """
+        Tắt chế độ 'Tác nhân' (nếu đang bật) để thanh prompt hiển thị nút cấu hình ảnh trực tiếp.
+        Khi Tác nhân bật (agent-mode-chip-checked), nút cài đặt ảnh bị ẩn.
+        """
+        try:
+            editor = page.locator(_Sel.PROMPT).first
+            if not await editor.is_visible():
+                return
+            toggled = await editor.evaluate("""(ed) => {
+                let box = ed.parentElement;
+                for (let i = 0; i < 8 && box; i++, box = box.parentElement) {
+                    const btns = Array.from(box.querySelectorAll('button'));
+                    const agentBtn = btns.find(b => b.innerText.includes('Tác nhân') || b.classList.contains('agent-mode-chip'));
+                    if (agentBtn && (agentBtn.classList.contains('agent-mode-chip-checked') || agentBtn.getAttribute('aria-checked') === 'true')) {
+                        agentBtn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if toggled:
+                logger.info("Đã tắt chế độ Tác nhân (chuyển sang tạo ảnh trực tiếp).")
+                await page.wait_for_timeout(500)
+        except Exception as exc:
+            logger.warning("Không thể kiểm tra/tắt chế độ Tác nhân: %s", exc)
+
     async def _find_aspect_settings_trigger(self, page: Page):
         """Tìm nút / pill mở bảng cài đặt chế độ hình ảnh (chứa Nano Banana / x1 / x2 / tỷ lệ...)."""
-        strategies = [
-            page.locator("div.bottom-controls button:has-text('Banana')").first,
-            page.locator("button:has-text('Banana')").first,
-            page.locator("button:has-text('Nano Banana')").first,
-            page.locator("div.bottom-controls button:has-text('x')").first,
-            page.locator("button:has-text('x1'), button:has-text('x2'), button:has-text('x3'), button:has-text('x4')").first,
-            page.locator("div.bottom-controls button:has-text(':')").first,
-            page.locator("button[aria-label*='cài đặt' i]").first,
-            page.locator("button[aria-label*='settings' i]").first,
-            page.locator("div.bottom-controls button").nth(1),
-        ]
-        for loc in strategies:
+        await self._close_side_panel_if_open(page)
+        await self._ensure_agent_mode_off(page)
+
+        editor = page.locator(_Sel.PROMPT).first
+        await editor.wait_for(state="visible", timeout=10_000)
+
+        # 1. Tìm chính xác qua cây DOM của thanh prompt
+        btn_handle = await editor.evaluate_handle("""(ed) => {
+            let box = ed.parentElement;
+            for (let i = 0; i < 8 && box; i++, box = box.parentElement) {
+                const btns = Array.from(box.querySelectorAll('button'));
+                const stBtn = btns.find(b => {
+                    const t = (b.innerText || '').toLowerCase();
+                    return b.classList.contains('settings-trigger-button') ||
+                           t.includes('banana') || t.includes('16:9') || t.includes('4:3') ||
+                           t.includes('1:1') || t.includes('3:4') || t.includes('9:16') ||
+                           t.includes('x1') || t.includes('x2') || t.includes('x3') || t.includes('x4');
+                });
+                if (stBtn && stBtn.offsetWidth > 0) return stBtn;
+            }
+            return null;
+        }""")
+
+        if btn_handle and btn_handle.as_element():
+            return btn_handle.as_element()
+
+        # 2. Fallback locators
+        for sel in [
+            ".settings-trigger-button",
+            "button:has-text('Banana')",
+            "button:has-text('16:9'), button:has-text('4:3'), button:has-text('1:1'), button:has-text('3:4'), button:has-text('9:16')",
+            "button:has-text('x1'), button:has-text('x2')",
+        ]:
+            loc = page.locator(sel).first
             try:
                 if await loc.count() > 0 and await loc.is_visible():
                     return loc
             except Exception:
                 continue
+
         raise RuntimeError("Không tìm thấy nút mở Cài đặt khung hình trên thanh prompt của Flow.")
 
     async def _ensure_aspect(self, page: Page, aspect: str) -> None:
         """
-        Mở bảng 'Chế độ mặc định của tính năng tạo hình ảnh' ở thanh prompt,
-        chọn loại khung hình (16:9, 4:3, 1:1, 3:4, 9:16) và x1, rồi đóng lại.
+        Mở bảng cài đặt ở thanh prompt, chọn loại khung hình (16:9, 4:3, 1:1, 3:4, 9:16) và x1, rồi đóng lại.
         Nhớ (project, tỷ lệ) đã chỉnh để các ảnh sau không phải mở lại nếu cùng tỷ lệ.
         """
         if aspect not in ASPECT_RATIOS:
@@ -523,30 +589,34 @@ class GoogleFlowDriver:
 
         logger.info("Đang cài đặt loại khung hình %s trên Google Flow …", aspect)
 
-        # 1. Kiểm tra xem popover cài đặt đã mở sẵn chưa
-        popover_indicator = page.locator("text='Chế độ mặc định của tính năng tạo hình ảnh', text='Default mode'")
-        is_open = await popover_indicator.count() > 0 and await popover_indicator.first.is_visible()
+        # 1. Đảm bảo giao diện sẵn sàng (đóng side panel, tắt Agent Mode)
+        await self._close_side_panel_if_open(page)
+        await self._ensure_agent_mode_off(page)
 
-        # 2. Nếu chưa mở, click nút trigger trên thanh prompt
+        # 2. Kiểm tra xem popover cài đặt đã mở sẵn chưa
+        popover = page.locator(".cdk-overlay-pane").first
+        is_open = await popover.count() > 0 and await popover.is_visible()
+
+        # 3. Nếu chưa mở, click nút trigger trên thanh prompt
         if not is_open:
             trigger = await self._find_aspect_settings_trigger(page)
             await trigger.click()
             await page.wait_for_timeout(600)
 
-        # 3. Chờ các nút lựa chọn xuất hiện
+        # 4. Chờ overlay xuất hiện
         try:
-            await page.locator(f"text='{aspect}'").first.wait_for(state="visible", timeout=4_000)
+            await page.locator(".cdk-overlay-pane").first.wait_for(state="visible", timeout=5_000)
         except Exception:
             pass
 
-        # 4. Click chọn loại khung hình
+        # 5. Click chọn loại khung hình trong overlay
         aspect_clicked = False
-
-        # Thử click qua JS evaluate (nhanh và chính xác theo text trong popover)
         try:
-            clicked_js = await page.evaluate(
+            aspect_clicked = await page.evaluate(
                 """(targetAspect) => {
-                    const all = Array.from(document.querySelectorAll('*'));
+                    const overlay = document.querySelector('.cdk-overlay-pane');
+                    const root = overlay || document;
+                    const all = Array.from(root.querySelectorAll('*'));
                     for (const el of all) {
                         const t = (el.innerText || '').trim();
                         if (t === targetAspect) {
@@ -559,8 +629,7 @@ class GoogleFlowDriver:
                 }""",
                 aspect,
             )
-            if clicked_js:
-                aspect_clicked = True
+            if aspect_clicked:
                 logger.info("Đã chọn loại khung hình: %s", aspect)
                 await page.wait_for_timeout(300)
         except Exception as exc:
@@ -569,17 +638,16 @@ class GoogleFlowDriver:
         # Fallback bằng Playwright locators
         if not aspect_clicked:
             aspect_locators = [
+                page.locator(f".cdk-overlay-pane button:has-text('{aspect}')").first,
                 page.locator(f"button:has-text('{aspect}')").first,
                 page.get_by_role("button", name=aspect, exact=True).first,
-                page.locator(f"[role='radio']:has-text('{aspect}')").first,
-                page.get_by_text(aspect, exact=True).first,
             ]
             for loc in aspect_locators:
                 try:
                     if await loc.count() > 0 and await loc.is_visible():
                         await loc.click()
                         aspect_clicked = True
-                        logger.info("Đã click chọn loại khung hình: %s", aspect)
+                        logger.info("Đã click chọn loại khung hình (fallback): %s", aspect)
                         await page.wait_for_timeout(300)
                         break
                 except Exception:
@@ -588,17 +656,17 @@ class GoogleFlowDriver:
         if not aspect_clicked:
             raise RuntimeError(f"Không thể click chọn loại khung hình '{aspect}' trong cài đặt của Flow.")
 
-        # 5. Đảm bảo chọn 'x1' để tạo đúng 1 ảnh mỗi prompt
+        # 6. Đảm bảo chọn 'x1' để tạo đúng 1 ảnh mỗi prompt
         try:
             await page.evaluate(
                 """() => {
-                    const all = Array.from(document.querySelectorAll('*'));
-                    for (const el of all) {
-                        if ((el.innerText || '').trim() === 'x1') {
-                            const clickable = el.closest('button, [role="radio"], [role="button"]') || el;
-                            clickable.click();
-                            return true;
-                        }
+                    const overlay = document.querySelector('.cdk-overlay-pane');
+                    const root = overlay || document;
+                    const all = Array.from(root.querySelectorAll('button, [role="radio"], [role="button"]'));
+                    const x1 = all.find(b => (b.innerText || '').trim() === 'x1');
+                    if (x1) {
+                        x1.click();
+                        return true;
                     }
                     return false;
                 }"""
@@ -607,10 +675,10 @@ class GoogleFlowDriver:
         except Exception as exc:
             logger.warning("Không chọn được x1: %s", exc)
 
-        # 6. Đóng popover cài đặt hoàn toàn để không che khuất ô nhập prompt
+        # 7. Đóng popover cài đặt hoàn toàn để không che khuất ô nhập prompt
         await self._close_aspect_popover(page)
 
-        # 7. Đảm bảo ô prompt sẵn sàng nhận chữ
+        # 8. Đảm bảo ô prompt sẵn sàng nhận chữ
         editor = page.locator(_Sel.PROMPT).first
         await editor.wait_for(state="visible", timeout=5_000)
 
@@ -619,11 +687,11 @@ class GoogleFlowDriver:
 
     async def _close_aspect_popover(self, page: Page) -> None:
         """
-        Đóng popover 'Chế độ mặc định của tính năng tạo hình ảnh'.
+        Đóng popover cài đặt khung hình (Angular CDK).
         Trong Flow, cài đặt tự động lưu ngay khi click. Chỉ cần đóng popover để giải phóng giao diện.
         """
-        popover_indicator = page.locator("text='Chế độ mặc định của tính năng tạo hình ảnh', text='Default mode'")
-        if not (await popover_indicator.count() > 0 and await popover_indicator.first.is_visible()):
+        overlay = page.locator(".cdk-overlay-pane").first
+        if not (await overlay.count() > 0 and await overlay.is_visible()):
             return
 
         logger.info("Đang đóng bảng cài đặt khung hình …")
@@ -638,15 +706,15 @@ class GoogleFlowDriver:
             pass
 
         # 2. Click vùng trống bên ngoài trên canvas
-        if await popover_indicator.count() > 0 and await popover_indicator.first.is_visible():
+        if await overlay.count() > 0 and await overlay.is_visible():
             try:
-                await page.mouse.click(200, 200)
+                await page.mouse.click(100, 100)
                 await page.wait_for_timeout(300)
             except Exception:
                 pass
 
         # 3. Bấm Escape
-        if await popover_indicator.count() > 0 and await popover_indicator.first.is_visible():
+        if await overlay.count() > 0 and await overlay.is_visible():
             try:
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(300)
@@ -654,7 +722,7 @@ class GoogleFlowDriver:
                 pass
 
         # 4. Click vào editor để lấy lại tiêu điểm
-        if await popover_indicator.count() > 0 and await popover_indicator.first.is_visible():
+        if await overlay.count() > 0 and await overlay.is_visible():
             try:
                 editor = page.locator(_Sel.PROMPT).first
                 if await editor.is_visible():
