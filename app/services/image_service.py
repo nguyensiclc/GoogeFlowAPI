@@ -99,10 +99,26 @@ class ImageGeneratorService:
 
     # ── Shared Browser Session Lifecycle ─────────────────────────────────────
 
-    async def _ensure_session(self) -> None:
+    def _is_session_alive(self) -> bool:
+        """Kiểm tra xem BrowserContext hiện tại có còn hoạt động hay không."""
+        if not self._context:
+            return False
+        try:
+            if hasattr(self._context, "is_closed") and self._context.is_closed():
+                return False
+            _ = self._context.pages
+            return True
+        except Exception:
+            return False
+
+    async def _ensure_session(self, force: bool = False) -> None:
         """Đảm bảo persistent context của Chrome và các driver đều đã sẵn sàng."""
-        if self._context and self._flow_driver and self._gemini_driver:
+        if not force and self._is_session_alive() and self._flow_driver and self._gemini_driver:
             return
+
+        if self._context:
+            logger.info("Phiên trình duyệt trước đó không còn khả dụng, đang khởi tạo lại …")
+            await self.shutdown()
 
         active_account = AccountManager.get_active_account()
         profile_dir = active_account["profile_dir"]
@@ -111,32 +127,29 @@ class ImageGeneratorService:
         if not self._playwright:
             self._playwright = await async_playwright().start()
 
-        if not self._context:
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=profile_dir,
-                executable_path=config.CHROME_EXECUTABLE,
-                headless=config.HEADLESS,
-                args=[
-                    "--start-maximized",
-                    f"--profile-directory={config.CHROME_PROFILE}",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-                no_viewport=True,
-            )
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            executable_path=config.CHROME_EXECUTABLE,
+            headless=config.HEADLESS,
+            args=[
+                "--start-maximized",
+                f"--profile-directory={config.CHROME_PROFILE}",
+                "--disable-blink-features=AutomationControlled",
+            ],
+            no_viewport=True,
+        )
 
-        if not self._flow_driver:
-            self._flow_driver = GoogleFlowDriver(context=self._context)
-            try:
-                await self._flow_driver.start()
-            except Exception as exc:
-                logger.warning("Chưa thể khởi tạo tab Flow: %s", exc)
+        self._flow_driver = GoogleFlowDriver(context=self._context)
+        try:
+            await self._flow_driver.start()
+        except Exception as exc:
+            logger.warning("Chưa thể khởi tạo tab Flow: %s", exc)
 
-        if not self._gemini_driver:
-            self._gemini_driver = GeminiChatDriver(context=self._context)
-            try:
-                await self._gemini_driver.start()
-            except Exception as exc:
-                logger.warning("Chưa thể khởi tạo tab Gemini: %s", exc)
+        self._gemini_driver = GeminiChatDriver(context=self._context)
+        try:
+            await self._gemini_driver.start()
+        except Exception as exc:
+            logger.warning("Chưa thể khởi tạo tab Gemini: %s", exc)
 
     async def startup(self) -> None:
         logger.info("ImageGeneratorService khởi động (enabled=%s) …", self.is_enabled)
@@ -232,9 +245,12 @@ class ImageGeneratorService:
 
             try:
                 if is_gemini:
-                    if not self._gemini_driver or not self._gemini_driver._page:
-                        self._gemini_driver = GeminiChatDriver(context=self._context)
-                        await self._gemini_driver.start()
+                    if not self._gemini_driver or not self._gemini_driver._page or self._gemini_driver._page.is_closed():
+                        if not self._is_session_alive():
+                            await self._ensure_session(force=True)
+                        else:
+                            self._gemini_driver = GeminiChatDriver(context=self._context)
+                            await self._gemini_driver.start()
 
                     path = await self._gemini_driver.generate_image(
                         prompt=task.prompt,
@@ -243,9 +259,12 @@ class ImageGeneratorService:
                         app_name=task.app_name,
                     )
                 else:
-                    if not self._flow_driver or not self._flow_driver._page:
-                        self._flow_driver = GoogleFlowDriver(context=self._context)
-                        await self._flow_driver.start()
+                    if not self._flow_driver or not self._flow_driver._page or self._flow_driver._page.is_closed():
+                        if not self._is_session_alive():
+                            await self._ensure_session(force=True)
+                        else:
+                            self._flow_driver = GoogleFlowDriver(context=self._context)
+                            await self._flow_driver.start()
 
                     path = await self._flow_driver.generate_image(
                         prompt=task.prompt,
@@ -260,6 +279,35 @@ class ImageGeneratorService:
                 logger.info("[%d/%d] ✓ Thành công [%s]: %s", idx, len(tasks), provider_name, path)
 
             except Exception as exc:
+                err_msg = str(exc)
+                # Tự động hồi phục nếu browser hoặc page bị đóng trong lúc chạy
+                if ("closed" in err_msg.lower() or "target page" in err_msg.lower()) and not getattr(task, "_retried", False):
+                    logger.warning("Trình duyệt bị ngắt kết nối (%s), tự động khởi động lại session và thử lại …", err_msg)
+                    setattr(task, "_retried", True)
+                    try:
+                        await self._ensure_session(force=True)
+                        if is_gemini:
+                            path = await self._gemini_driver.generate_image(
+                                prompt=task.prompt,
+                                aspect_ratio=task.aspect_ratio,
+                                reference_images=task.reference_images,
+                                app_name=task.app_name,
+                            )
+                        else:
+                            path = await self._flow_driver.generate_image(
+                                prompt=task.prompt,
+                                aspect_ratio=task.aspect_ratio,
+                                reference_images=task.reference_images,
+                                app_name=task.app_name,
+                                project_url=task.project_url,
+                            )
+                        results.append(GeneratedImage(prompt=task.prompt, file_path=path, provider=provider_target))
+                        self.total_generated += 1
+                        logger.info("[%d/%d] ✓ Thành công sau khi khôi phục [%s]: %s", idx, len(tasks), provider_name, path)
+                        continue
+                    except Exception as retry_exc:
+                        exc = retry_exc
+
                 logger.error("[%d/%d] ✗ Thất bại [%s]: %s", idx, len(tasks), provider_name, exc)
                 results.append(
                     GeneratedImage(

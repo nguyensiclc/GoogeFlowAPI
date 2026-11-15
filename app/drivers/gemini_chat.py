@@ -176,12 +176,26 @@ class GeminiChatDriver:
     async def __aexit__(self, *_) -> None:
         await self.stop()
 
+    def _is_alive(self) -> bool:
+        if not self._context:
+            return False
+        try:
+            if hasattr(self._context, "is_closed") and self._context.is_closed():
+                return False
+            return self._page is not None and not self._page.is_closed()
+        except Exception:
+            return False
+
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     async def _dismiss_consent_modals(self, page: Page) -> None:
         """Kiểm tra và tự động click các nút đóng hộp thoại 'Tôi hiểu' / 'Đồng ý'."""
+        if not page or page.is_closed():
+            return
         for sel in _GeminiSel.CONSENT_BUTTONS:
             try:
+                if page.is_closed():
+                    return
                 loc = page.locator(sel)
                 if await loc.count() > 0 and await loc.first.is_visible():
                     logger.info("Đóng hộp thoại đồng ý trên Gemini: %s", sel)
@@ -381,7 +395,7 @@ class GeminiChatDriver:
         - reference_images: Danh sách file ảnh mẫu.
         - app_name: Tên ứng dụng gọi (để phân luồng ghi log).
         """
-        if not self._page or self._page.is_closed():
+        if not self._is_alive():
             await self.start()
 
         page = self._page
@@ -426,19 +440,54 @@ class GeminiChatDriver:
         out_path = (config.OUTPUT_DIR / out_filename).resolve()
 
         logger.info("Đang tải dữ liệu ảnh từ URL về đĩa: %s", out_path.name)
-        try:
-            resp = await page.request.get(image_url)
-            if resp.ok:
-                out_path.write_bytes(await resp.body())
-                logger.info("✓ Đã lưu ảnh thành công: %s (%d bytes)", out_path.name, out_path.stat().st_size)
-                return out_path
-            else:
-                logger.warning("HTTP %d khi tải ảnh từ URL, thử fallback sang screenshot...", resp.status)
-        except Exception as exc:
-            logger.warning("Lỗi tải ảnh qua page.request: %s. Thử fallback...", exc)
+        if image_url.startswith("blob:"):
+            try:
+                data_url: str = await page.evaluate(
+                    """async (u) => {
+                        const r = await fetch(u);
+                        const b = await r.blob();
+                        return new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => resolve(reader.result);
+                            reader.onerror = reject;
+                            reader.readAsDataURL(b);
+                        });
+                    }""",
+                    image_url,
+                )
+                if "," in data_url:
+                    out_path.write_bytes(base64.b64decode(data_url.split(",", 1)[1]))
+                    logger.info("✓ Đã lưu ảnh từ blob URL thành công: %s (%d bytes)", out_path.name, out_path.stat().st_size)
+                    return out_path
+            except Exception as exc:
+                logger.warning("Lỗi trích xuất blob: %s, thử fallback...", exc)
 
-        # Fallback: Tìm element ảnh và chụp trực tiếp
-        img_loc = page.locator(_GeminiSel.GENERATED_IMAGE).last
+        elif image_url.startswith("https://") or image_url.startswith("http://"):
+            try:
+                resp = await page.request.get(image_url)
+                if resp.ok:
+                    out_path.write_bytes(await resp.body())
+                    logger.info("✓ Đã lưu ảnh thành công: %s (%d bytes)", out_path.name, out_path.stat().st_size)
+                    return out_path
+                else:
+                    logger.warning("HTTP %d khi tải ảnh từ URL, thử fallback sang screenshot...", resp.status)
+            except Exception as exc:
+                logger.warning("Lỗi tải ảnh qua page.request: %s. Thử fallback...", exc)
+
+        # Fallback: Tìm element ảnh và chụp trực tiếp (ẩn các nút action overlay trước để ảnh sạch 100%)
+        try:
+            await page.evaluate("""() => {
+                document.querySelectorAll(
+                    '.generated-image-controls, share-button, copy-button, download-generated-image-button'
+                ).forEach(el => el.style.display = 'none');
+            }""")
+            await page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+        img_loc = page.locator("div.overlay-container img.image, button.image-button img, img.animate.loaded").last
+        if not await img_loc.is_visible():
+            img_loc = page.locator(_GeminiSel.GENERATED_IMAGE).last
         await img_loc.screenshot(path=str(out_path))
         logger.info("✓ Đã lưu ảnh qua element screenshot: %s", out_path.name)
         return out_path
