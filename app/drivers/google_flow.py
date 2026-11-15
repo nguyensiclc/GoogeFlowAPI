@@ -520,64 +520,131 @@ class GoogleFlowDriver:
         except Exception:
             pass
 
-        # 4. Click chọn loại khung hình (16:9, 4:3, 1:1, 3:4, 9:16)
+        # 4. Click chọn loại khung hình
         aspect_clicked = False
-        aspect_locators = [
-            page.locator(f"button:has-text('{aspect}')").first,
-            page.get_by_role("button", name=aspect, exact=True).first,
-            page.locator(f"[role='radio']:has-text('{aspect}')").first,
-            page.get_by_text(aspect, exact=True).first,
-        ]
-        for loc in aspect_locators:
-            try:
-                if await loc.count() > 0 and await loc.is_visible():
-                    await loc.click()
-                    aspect_clicked = True
-                    logger.info("Đã click chọn loại khung hình: %s", aspect)
-                    await page.wait_for_timeout(300)
-                    break
-            except Exception:
-                continue
+
+        # Thử click qua JS evaluate (nhanh và chính xác theo text trong popover)
+        try:
+            clicked_js = await page.evaluate(
+                """(targetAspect) => {
+                    const all = Array.from(document.querySelectorAll('*'));
+                    for (const el of all) {
+                        const t = (el.innerText || '').trim();
+                        if (t === targetAspect) {
+                            const clickable = el.closest('button, [role="radio"], [role="button"]') || el;
+                            clickable.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                aspect,
+            )
+            if clicked_js:
+                aspect_clicked = True
+                logger.info("Đã chọn loại khung hình: %s", aspect)
+                await page.wait_for_timeout(300)
+        except Exception as exc:
+            logger.warning("Click qua JS gặp lỗi: %s", exc)
+
+        # Fallback bằng Playwright locators
+        if not aspect_clicked:
+            aspect_locators = [
+                page.locator(f"button:has-text('{aspect}')").first,
+                page.get_by_role("button", name=aspect, exact=True).first,
+                page.locator(f"[role='radio']:has-text('{aspect}')").first,
+                page.get_by_text(aspect, exact=True).first,
+            ]
+            for loc in aspect_locators:
+                try:
+                    if await loc.count() > 0 and await loc.is_visible():
+                        await loc.click()
+                        aspect_clicked = True
+                        logger.info("Đã click chọn loại khung hình: %s", aspect)
+                        await page.wait_for_timeout(300)
+                        break
+                except Exception:
+                    continue
 
         if not aspect_clicked:
             raise RuntimeError(f"Không thể click chọn loại khung hình '{aspect}' trong cài đặt của Flow.")
 
-        # 5. Đảm bảo chọn 'x1' để tạo 1 ảnh mỗi prompt
+        # 5. Đảm bảo chọn 'x1' để tạo đúng 1 ảnh mỗi prompt
         try:
-            x1_btn = page.locator("button:has-text('x1'), [role='radio']:has-text('x1'), text='x1'").first
-            if await x1_btn.count() > 0 and await x1_btn.is_visible():
-                await x1_btn.click()
-                await page.wait_for_timeout(200)
+            await page.evaluate(
+                """() => {
+                    const all = Array.from(document.querySelectorAll('*'));
+                    for (const el of all) {
+                        if ((el.innerText || '').trim() === 'x1') {
+                            const clickable = el.closest('button, [role="radio"], [role="button"]') || el;
+                            clickable.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+            await page.wait_for_timeout(200)
         except Exception as exc:
             logger.warning("Không chọn được x1: %s", exc)
 
-        # 6. Đóng popover cài đặt (bấm Escape)
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(400)
+        # 6. Đóng popover cài đặt hoàn toàn để không che khuất ô nhập prompt
+        await self._close_aspect_popover(page)
 
+        # 7. Đảm bảo ô prompt sẵn sàng nhận chữ
         editor = page.locator(_Sel.PROMPT).first
-        await editor.wait_for(state="visible", timeout=3_000)
+        await editor.wait_for(state="visible", timeout=5_000)
 
         self._aspect_for = key
-        logger.info("✅ Đã thiết lập thành công loại khung hình: %s", aspect)
+        logger.info("✅ Đã thiết lập xong loại khung hình: %s", aspect)
 
-    async def _close_settings(self, page: Page, settings_btn) -> None:
-        """Đóng bảng cài đặt nếu còn mở."""
-        try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
-            await settings_btn.click(timeout=3_000)
-        except Exception:
-            pass
-        if await editor_back():
+    async def _close_aspect_popover(self, page: Page) -> None:
+        """
+        Đóng popover 'Chế độ mặc định của tính năng tạo hình ảnh'.
+        Trong Flow, cài đặt tự động lưu ngay khi click. Chỉ cần đóng popover để giải phóng giao diện.
+        """
+        popover_indicator = page.locator("text='Chế độ mặc định của tính năng tạo hình ảnh', text='Default mode'")
+        if not (await popover_indicator.count() > 0 and await popover_indicator.first.is_visible()):
             return
+
+        logger.info("Đang đóng bảng cài đặt khung hình …")
+
+        # 1. Click backdrop của Angular CDK nếu có
         try:
-            await page.mouse.click(10, 10)
+            backdrop = page.locator(".cdk-overlay-backdrop").last
+            if await backdrop.count() > 0 and await backdrop.is_visible():
+                await backdrop.click(position={"x": 5, "y": 5}, force=True, timeout=2_000)
+                await page.wait_for_timeout(300)
         except Exception:
             pass
-        if not await editor_back():
-            logger.warning("Ô prompt vẫn bị ẩn sau khi đóng Cài đặt.")
+
+        # 2. Click vùng trống bên ngoài trên canvas
+        if await popover_indicator.count() > 0 and await popover_indicator.first.is_visible():
+            try:
+                await page.mouse.click(200, 200)
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        # 3. Bấm Escape
+        if await popover_indicator.count() > 0 and await popover_indicator.first.is_visible():
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        # 4. Click vào editor để lấy lại tiêu điểm
+        if await popover_indicator.count() > 0 and await popover_indicator.first.is_visible():
+            try:
+                editor = page.locator(_Sel.PROMPT).first
+                if await editor.is_visible():
+                    await editor.click(force=True, timeout=2_000)
+                    await page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        logger.info("Đã đóng bảng cài đặt khung hình.")
 
     # ── Prompt input ─────────────────────────────────────────────────────────
 
