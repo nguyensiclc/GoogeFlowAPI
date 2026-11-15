@@ -6,15 +6,28 @@ Service tạo ảnh từ Google Flow đang chạy ngầm độc lập tại:
 
 ---
 
-## 1. Đặc tả API
+## 1. Phân Vùng Project Theo Từng Ứng Dụng (`app_name`)
+
+Dịch vụ hỗ trợ **tự động tách riêng mỗi ứng dụng một Project độc lập trên Google Flow**:
+- Mỗi khi app gửi request kèm thông số `app_name` (ví dụ: `"AppTruyenTranh"`, `"AppStory"`, `"AppMarketing"`):
+  - Hệ thống sẽ tự động kiểm tra xem app đó đã có Project riêng trên Flow chưa.
+  - **Nếu chưa có**: Tự động bấm "Dự án mới" trên flow.google.com để tạo một Project riêng cho app đó và lưu lại URL.
+  - **Nếu đã có**: Trình duyệt tự chuyển ngay vào đúng Project của app đó để tạo ảnh.
+  - Các app không truyền `app_name` sẽ dùng Project mặc định (`default`).
+- **Lợi ích**: Ảnh của app truyện tranh, app làm video hay app marketing không bị lẫn lộn vào nhau trên giao diện Google Flow.
+
+---
+
+## 2. Đặc tả API
 
 ### Cách 1: Gọi JSON (`POST /api/v1/generate`)
 
 Hỗ trợ cả prompt thuần túy và prompt **kèm ảnh tham chiếu** (qua URL web, Base64 hoặc đường dẫn file cục bộ).
 
-#### A. Gửi danh sách kèm ảnh tham chiếu riêng cho từng prompt:
+#### A. Gửi danh sách kèm ảnh tham chiếu và app_name riêng cho từng prompt:
 ```json
 {
+  "app_name": "AppTruyenTranh",
   "items": [
     {
       "prompt": "Vẽ nhân vật này đang ngồi đọc sách trong quán cafe anime, ánh nắng ấm áp",
@@ -33,11 +46,15 @@ Hỗ trợ cả prompt thuần túy và prompt **kèm ảnh tham chiếu** (qua 
 #### B. Gửi 1 ảnh tham chiếu chung cho nhiều prompt:
 ```json
 {
+  "app_name": "AppVideoShorts",
   "prompts": [
     "Cảnh 1: Nhân vật đang đi dạo trên đường phố Tokyo",
     "Cảnh 2: Nhân vật đang thưởng thức trà chiều"
   ],
   "reference_image": "https://example.com/sample_character.png",
+  "aspect_ratio": "9:16"
+}
+```
   "aspect_ratio": "9:16"
 }
 ```
@@ -73,10 +90,12 @@ Endpoint dạng **Multipart Form** (`multipart/form-data`) phù hợp khi ứng 
   - `prompt` (text): Mô tả ảnh cần tạo.
   - `reference_file` (file): File ảnh tham chiếu (PNG, JPG, WEBP).
   - `aspect_ratio` (text, tuỳ chọn): `"16:9"`, `"4:3"`, `"1:1"`, `"3:4"`, `"9:16"`.
+  - `app_name` (text, tuỳ chọn): Tên ứng dụng để tự động phân vùng project trên Flow (ví dụ: `"AppTruyenTranh"`).
 
 Ví dụ cURL:
 ```bash
 curl -X POST "http://localhost:8080/api/v1/generate-with-file" \
+  -F "app_name=AppTruyenTranh" \
   -F "prompt=Vẽ phong cảnh với phong cách màu sắc tương tự ảnh này" \
   -F "reference_file=@D:/Photos/my_style.jpg" \
   -F "aspect_ratio=9:16"

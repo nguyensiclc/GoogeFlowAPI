@@ -48,9 +48,26 @@ class TaskItemModel(BaseModel):
         None,
         description="Bí danh tiếng Việt của aspect_ratio",
     )
+    app_name: Optional[str] = Field(
+        None,
+        description="Tên ứng dụng gọi API (tự động phân vùng Project riêng trên Flow)",
+        examples=["AppTruyenTranh"],
+    )
+    project_name: Optional[str] = Field(
+        None,
+        description="Bí danh của app_name",
+        examples=["AppTruyenTranh"],
+    )
+    project_url: Optional[str] = Field(
+        None,
+        description="Chỉ định trực tiếp URL project Flow cần dùng (tùy chọn)",
+    )
 
     def get_aspect_ratio(self) -> Optional[str]:
         return self.aspect_ratio or self.khung_hinh or self.loai_khung_hinh
+
+    def get_app_name(self) -> Optional[str]:
+        return self.app_name or self.project_name
 
 
 class GenerateRequest(BaseModel):
@@ -86,9 +103,26 @@ class GenerateRequest(BaseModel):
         description="Bí danh tiếng Việt của aspect_ratio",
         examples=["16:9"],
     )
+    app_name: Optional[str] = Field(
+        default=None,
+        description="Tên ứng dụng gọi API (tự động phân vùng Project riêng trên Flow)",
+        examples=["AppTruyenTranh"],
+    )
+    project_name: Optional[str] = Field(
+        default=None,
+        description="Bí danh của app_name",
+        examples=["AppTruyenTranh"],
+    )
+    project_url: Optional[str] = Field(
+        default=None,
+        description="Chỉ định trực tiếp URL project Flow cần dùng (tùy chọn)",
+    )
 
     def get_aspect_ratio(self) -> Optional[str]:
         return self.aspect_ratio or self.khung_hinh or self.loai_khung_hinh
+
+    def get_app_name(self) -> Optional[str]:
+        return self.app_name or self.project_name
 
 
 class ImageResult(BaseModel):
@@ -115,6 +149,11 @@ class SetProjectRequest(BaseModel):
         ...,
         description="URL project muốn dùng. Dạng: https://flow.google.com/project/<id>",
         examples=["https://flow.google.com/project/b77249bb-f939-4cc4-8a55-c9aa914782ae"],
+    )
+    app_name: Optional[str] = Field(
+        default="default",
+        description="Tên ứng dụng muốn gán URL này",
+        examples=["AppTruyenTranh"],
     )
 
 
@@ -163,6 +202,8 @@ async def generate_images(
     """
     tasks: List[TaskItem] = []
     common_ratio = body.get_aspect_ratio()
+    common_app = body.get_app_name()
+    common_project_url = body.project_url
 
     # 1. Nếu truyền items chi tiết
     if body.items:
@@ -183,7 +224,17 @@ async def generate_images(
                 raise HTTPException(status_code=400, detail=f"Lỗi nạp ảnh tham chiếu cho prompt '{it.prompt[:50]}': {exc}")
 
             ratio = it.get_aspect_ratio() or common_ratio
-            tasks.append(TaskItem(prompt=it.prompt, reference_images=ref_paths, aspect_ratio=ratio))
+            app = it.get_app_name() or common_app
+            p_url = it.project_url or common_project_url
+            tasks.append(
+                TaskItem(
+                    prompt=it.prompt,
+                    reference_images=ref_paths,
+                    aspect_ratio=ratio,
+                    app_name=app,
+                    project_url=p_url,
+                )
+            )
 
     # 2. Nếu truyền prompts đơn giản
     elif body.prompts:
@@ -199,7 +250,15 @@ async def generate_images(
             raise HTTPException(status_code=400, detail=f"Lỗi nạp ảnh tham chiếu: {exc}")
 
         for p in body.prompts:
-            tasks.append(TaskItem(prompt=p, reference_images=common_ref_paths, aspect_ratio=common_ratio))
+            tasks.append(
+                TaskItem(
+                    prompt=p,
+                    reference_images=common_ref_paths,
+                    aspect_ratio=common_ratio,
+                    app_name=common_app,
+                    project_url=common_project_url,
+                )
+            )
 
     else:
         raise HTTPException(
@@ -253,6 +312,9 @@ async def generate_with_file(
     loai_khung_hinh: Optional[Literal["16:9", "4:3", "1:1", "3:4", "9:16"]] = Form(
         None, description="Bí danh tiếng Việt của aspect_ratio"
     ),
+    app_name: Optional[str] = Form(None, description="Tên ứng dụng gọi API (tự động dùng project riêng)"),
+    project_name: Optional[str] = Form(None, description="Bí danh của app_name"),
+    project_url: Optional[str] = Form(None, description="URL project tùy chọn"),
     request: Request = None,
     service=Depends(get_service),
 ):
@@ -266,10 +328,13 @@ async def generate_with_file(
     target_path.write_bytes(content)
 
     chosen_ratio = aspect_ratio or khung_hinh or loai_khung_hinh
+    chosen_app = app_name or project_name
     task = TaskItem(
         prompt=prompt,
         reference_images=[target_path.resolve()],
         aspect_ratio=chosen_ratio,
+        app_name=chosen_app,
+        project_url=project_url,
     )
 
     try:
@@ -379,8 +444,8 @@ async def delete_account(account_id: str):
 # ─── Project management ──────────────────────────────────────────────────────
 
 @router.get("/project", response_model=ProjectInfo, summary="Xem project đang dùng")
-async def get_project(service=Depends(get_service)):
-    info = service.get_project_info()
+async def get_project(app_name: str = "default", service=Depends(get_service)):
+    info = service.get_project_info(app_name=app_name)
     return ProjectInfo(**info)
 
 
@@ -391,14 +456,40 @@ async def set_project(body: SetProjectRequest, service=Depends(get_service)):
             status_code=400,
             detail="URL không hợp lệ. Phải có dạng https://flow.google.com/project/<id>",
         )
-    info = await service.switch_project(body.project_url)
+    target_app = body.app_name or "default"
+    info = await service.switch_project(body.project_url, app_name=target_app)
     return ProjectInfo(**info)
 
 
 @router.post("/project/new", response_model=ProjectInfo, summary="Tạo project mới trên flow.google.com")
-async def create_new_project(service=Depends(get_service)):
-    info = await service.create_new_project()
+async def create_new_project(app_name: str = "default", service=Depends(get_service)):
+    info = await service.create_new_project(app_name=app_name)
     return ProjectInfo(**info)
+
+
+@router.get("/projects", summary="Danh sách project của tất cả các ứng dụng")
+async def list_projects(service=Depends(get_service)):
+    """Trả về danh sách mapping giữa app_name và Google Flow project_url."""
+    return service.list_projects()
+
+
+@router.delete("/projects/{app_name}", summary="Xóa liên kết project của một ứng dụng")
+async def delete_app_project(app_name: str, service=Depends(get_service)):
+    """Xóa liên kết project của ứng dụng (lần gọi tiếp theo sẽ tự động sinh project mới trên Flow)."""
+    success = service.delete_project(app_name)
+    return {"success": success, "message": f"Đã xóa liên kết project cho app '{app_name}'."}
+
+
+@router.put("/projects/{app_name}", summary="Gán URL project thủ công cho một ứng dụng")
+async def set_app_project_url(app_name: str, body: SetProjectRequest, service=Depends(get_service)):
+    """Gán trực tiếp một project URL cho app_name."""
+    if "/project/" not in body.project_url:
+        raise HTTPException(
+            status_code=400,
+            detail="URL không hợp lệ. Phải có dạng https://flow.google.com/project/<id>",
+        )
+    info = await service.switch_project(body.project_url, app_name=app_name)
+    return info
 
 
 # ─── Gallery ─────────────────────────────────────────────────────────────────

@@ -139,10 +139,13 @@ class GoogleFlowDriver:
         prompt: str,
         aspect_ratio: Optional[str] = None,
         reference_images: Optional[List[Path]] = None,
+        app_name: Optional[str] = None,
+        project_url: Optional[str] = None,
     ) -> Path:
         """
         Tạo ảnh từ prompt (có thể kèm ảnh tham chiếu). Trả về path file ảnh đã lưu.
-        Nếu project không còn tồn tại, tự động tạo project mới.
+        app_name: tên ứng dụng gọi API (tự động phân vùng Project riêng trên Flow).
+        project_url: URL project chỉ định trực tiếp (nếu có).
         aspect_ratio: "16:9" | "4:3" | "1:1" | "3:4" | "9:16" — None = giữ cài đặt hiện tại của project.
         reference_images: danh sách đường dẫn các file ảnh tham chiếu cần tải lên.
         """
@@ -152,8 +155,8 @@ class GoogleFlowDriver:
         page = self._page
         output_path = config.OUTPUT_DIR / f"{uuid.uuid4().hex}.png"
 
-        # 1. Điều hướng đến project (tạo mới nếu cần)
-        await self._navigate_to_project(page)
+        # 1. Điều hướng đến project riêng của app (tự tạo nếu chưa có)
+        await self._ensure_and_navigate_app_project(page, app_name=app_name, project_url=project_url)
 
         # 1b. Chỉnh tỷ lệ khung hình + 1 ảnh mỗi lần tạo (chỉ khi đổi tỷ lệ hoặc đổi project)
         if aspect_ratio:
@@ -381,26 +384,55 @@ class GoogleFlowDriver:
 
     # ── Project management ───────────────────────────────────────────────────
 
-    async def _ensure_project(self, page: Page) -> str:
+    async def _ensure_and_navigate_app_project(
+        self,
+        page: Page,
+        app_name: Optional[str] = None,
+        project_url: Optional[str] = None,
+    ) -> str:
         """
-        Đảm bảo có project hợp lệ:
-        1. Đọc .flow_project.json
-        2. Kiểm tra project còn tồn tại (HTTP 200)
-        3. Nếu không → tạo project mới
+        Đảm bảo page đang mở đúng project URL của app_name (hoặc project_url tùy chỉnh).
+        Nếu project chưa có hoặc không còn tồn tại trên Flow, tự động tạo mới và cập nhật ProjectStore.
         """
-        stored_url = ProjectStore.load()
+        target_app = (app_name or "default").strip()
 
-        if stored_url:
-            logger.info("Kiểm tra project đã lưu: %s", stored_url)
-            if await self._project_exists(page, stored_url):
-                return stored_url
-            logger.warning("Project không còn tồn tại — sẽ tạo project mới.")
-            ProjectStore.clear()
+        # 1. Nếu caller cung cấp trực tiếp project_url
+        if project_url and "/project/" in project_url:
+            target_url = project_url
+        else:
+            # Lấy URL đã lưu cho app này
+            target_url = ProjectStore.get_project(target_app)
 
-        logger.info("Tạo project mới trên flow.google.com …")
+        # 2. Nếu đã ở đúng project_url đó trên trình duyệt, không cần navigate lại
+        if target_url and page.url.startswith(target_url):
+            self._project_url = target_url
+            return target_url
+
+        # 3. Nếu có target_url, kiểm tra và navigate
+        if target_url:
+            logger.info("Chuyển tới project của app [%s]: %s", target_app, target_url)
+            try:
+                response = await page.goto(target_url, wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT * 1000)
+                await page.wait_for_load_state("networkidle", timeout=10_000)
+                if "/project/" in page.url and (response is None or response.status != 404):
+                    self._project_url = page.url
+                    if page.url != target_url:
+                        ProjectStore.set_project(target_app, page.url)
+                    return self._project_url
+                logger.warning("Project [%s] không còn hợp lệ trên Flow — sẽ tự tạo project mới.", target_app)
+            except Exception as e:
+                logger.warning("Không thể mở project [%s]: %s — sẽ tạo project mới.", target_app, e)
+
+        # 4. Chưa có project hoặc project cũ không còn -> Tự động tạo project mới cho app
+        logger.info("Tự động tạo Project mới trên Google Flow cho app [%s] …", target_app)
         new_url = await self._create_new_project(page)
-        ProjectStore.save(new_url)
+        ProjectStore.set_project(target_app, new_url)
+        self._project_url = new_url
         return new_url
+
+    async def _ensure_project(self, page: Page) -> str:
+        """Đảm bảo có project mặc định hợp lệ khi khởi động."""
+        return await self._ensure_and_navigate_app_project(page, app_name="default")
 
     async def _project_exists(self, page: Page, url: str) -> bool:
         """Kiểm tra project còn tồn tại bằng cách navigate và xem có lỗi không."""
@@ -451,20 +483,7 @@ class GoogleFlowDriver:
 
     async def _navigate_to_project(self, page: Page) -> None:
         """Điều hướng đến project. Tạo mới nếu project không còn tồn tại."""
-        # Nếu đã ở đúng project rồi, không cần reload
-        if self._project_url and page.url.startswith(self._project_url):
-            return
-
-        logger.info("Điều hướng đến project: %s", self._project_url)
-        response = await page.goto(self._project_url, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle", timeout=config.PAGE_LOAD_TIMEOUT * 1000)
-
-        # Nếu bị redirect ra ngoài project (project đã bị xóa)
-        if "/project/" not in page.url or (response and response.status == 404):
-            logger.warning("Project không còn — tạo project mới …")
-            ProjectStore.clear()
-            self._project_url = await self._create_new_project(page)
-            ProjectStore.save(self._project_url)
+        await self._ensure_and_navigate_app_project(page, app_name="default", project_url=self._project_url)
 
     # ── Aspect ratio (Loại khung hình) ───────────────────────────────────────
 

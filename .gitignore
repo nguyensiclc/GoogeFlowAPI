@@ -5,6 +5,7 @@
 
 # Project ID do app tự tạo và quản lý
 .flow_project.json
+.flow_projects.json
 
 # Virtual environment
 .venv/

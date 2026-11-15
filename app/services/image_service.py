@@ -39,16 +39,20 @@ class GeneratedImage:
 
 
 class TaskItem:
-    """Tác vụ tạo ảnh đơn lẻ, có thể kèm danh sách ảnh tham chiếu và tỷ lệ khung hình."""
+    """Tác vụ tạo ảnh đơn lẻ, có thể kèm danh sách ảnh tham chiếu, tỷ lệ khung hình và app_name."""
     def __init__(
         self,
         prompt: str,
         reference_images: Optional[List[Path]] = None,
         aspect_ratio: Optional[str] = None,
+        app_name: Optional[str] = None,
+        project_url: Optional[str] = None,
     ):
         self.prompt = prompt
         self.reference_images = reference_images or []
         self.aspect_ratio = aspect_ratio
+        self.app_name = app_name
+        self.project_url = project_url
 
 
 class ImageGeneratorService:
@@ -134,12 +138,15 @@ class ImageGeneratorService:
         results: List[GeneratedImage] = []
         for idx, task in enumerate(tasks, 1):
             ref_info = f" (+ {len(task.reference_images)} ảnh tham chiếu)" if task.reference_images else ""
-            logger.info("[%d/%d] Đang tạo ảnh cho: %s%s", idx, len(tasks), task.prompt[:80], ref_info)
+            app_info = f" [App: {task.app_name}]" if task.app_name else ""
+            logger.info("[%d/%d]%s Đang tạo ảnh cho: %s%s", idx, len(tasks), app_info, task.prompt[:80], ref_info)
             try:
                 path = await self._driver.generate_image(
                     prompt=task.prompt,
                     aspect_ratio=task.aspect_ratio,
                     reference_images=task.reference_images,
+                    app_name=task.app_name,
+                    project_url=task.project_url,
                 )
                 results.append(GeneratedImage(prompt=task.prompt, file_path=path))
                 self.total_generated += 1
@@ -155,50 +162,61 @@ class ImageGeneratorService:
         prompts: List[str],
         aspect_ratio: Optional[str] = None,
         reference_images: Optional[List[Path]] = None,
+        app_name: Optional[str] = None,
+        project_url: Optional[str] = None,
     ) -> List[GeneratedImage]:
         """Tạo ảnh tuần tự cho từng prompt (tương thích ngược với lời gọi cũ)."""
         tasks = [
-            TaskItem(prompt=p, aspect_ratio=aspect_ratio, reference_images=reference_images)
+            TaskItem(
+                prompt=p,
+                aspect_ratio=aspect_ratio,
+                reference_images=reference_images,
+                app_name=app_name,
+                project_url=project_url,
+            )
             for p in prompts
         ]
         return await self.generate_tasks(tasks)
 
     # ── Project management ───────────────────────────────────────────────────
 
-    def get_project_info(self) -> dict:
-        store_file = Path(".flow_project.json")
-        if store_file.exists():
-            try:
-                data = json.loads(store_file.read_text(encoding="utf-8"))
-                return {
-                    "project_url": data.get("project_url"),
-                    "created_at": data.get("created_at"),
-                }
-            except Exception:
-                pass
+    def get_project_info(self, app_name: str = "default") -> dict:
+        projects = ProjectStore.list_projects()
+        entry = projects.get(app_name or "default")
+        if entry:
+            return entry
         return {
             "project_url": self._driver._project_url if self._driver else None,
             "created_at": None,
         }
 
-    async def switch_project(self, project_url: str) -> dict:
-        if not self._driver:
-            raise RuntimeError("Driver chưa khởi động.")
-        logger.info("Chuyển sang project: %s", project_url)
-        ProjectStore.save(project_url)
-        self._driver._project_url = project_url
-        await self._driver._navigate_to_project(self._driver._page)
-        return self.get_project_info()
+    def list_projects(self) -> Dict[str, dict]:
+        return ProjectStore.list_projects()
 
-    async def create_new_project(self) -> dict:
+    def delete_project(self, app_name: str) -> bool:
+        return ProjectStore.delete_project(app_name)
+
+    async def switch_project(self, project_url: str, app_name: str = "default") -> dict:
         if not self._driver:
             raise RuntimeError("Driver chưa khởi động.")
-        logger.info("Tạo project mới trên Flow …")
-        ProjectStore.clear()
+        logger.info("Chuyển sang project [%s]: %s", app_name, project_url)
+        ProjectStore.set_project(app_name, project_url)
+        self._driver._project_url = project_url
+        await self._driver._ensure_and_navigate_app_project(
+            self._driver._page,
+            app_name=app_name,
+            project_url=project_url,
+        )
+        return self.get_project_info(app_name)
+
+    async def create_new_project(self, app_name: str = "default") -> dict:
+        if not self._driver:
+            raise RuntimeError("Driver chưa khởi động.")
+        logger.info("Tạo project mới trên Flow cho app [%s] …", app_name)
         new_url = await self._driver._create_new_project(self._driver._page)
-        ProjectStore.save(new_url)
+        ProjectStore.set_project(app_name, new_url)
         self._driver._project_url = new_url
-        return self.get_project_info()
+        return self.get_project_info(app_name)
 
     # ── System status for UI ─────────────────────────────────────────────────
 
@@ -214,5 +232,6 @@ class ImageGeneratorService:
             "active_account": active_account,
             "accounts": accounts,
             "project_url": project_info.get("project_url"),
+            "projects": ProjectStore.list_projects(),
             "total_generated": self.total_generated,
         }

@@ -7,10 +7,11 @@ Dịch vụ REST API độc lập (FastAPI) nhận input là prompt tạo ảnh,
 ## 🌟 Tính năng chính
 
 - **API tập trung**: Nhận 1 hoặc một danh sách nhiều prompt (`list[str]`), sinh ảnh tuần tự, nhận bao nhiêu prompt trả về bấy nhiêu ảnh.
+- **Phân vùng Project tự động theo từng App (`app_name`)**: Mỗi ứng dụng gọi API truyền `app_name` (ví dụ `AppTruyenTranh`, `AppStory`) sẽ tự động được cấp và duy trì một Project riêng trên Google Flow mà không bị lẫn ảnh.
+- **Hỗ trợ ảnh tham chiếu (Reference Image)**: Nhận ảnh qua URL, Base64 hoặc upload file trực tiếp (`POST /api/v1/generate-with-file`).
+- **Tùy chỉnh tỷ lệ khung hình (Aspect Ratio)**: Hỗ trợ `16:9`, `4:3`, `1:1`, `3:4`, `9:16`, tự động khóa chế độ `x1` để tiết kiệm hạn ngạch.
 - **Output đa dạng**: Trả về cả **đường dẫn file cục bộ (`file_path`)**, **đường link trực tiếp (`image_url`)**, và **chuỗi `base64`**.
-- **CORS sẵn sàng**: Hỗ trợ gọi API từ bất kỳ client nào (Node.js, Python, PHP, web frontend, n8n, Zapier...).
-- **Chrome Profile độc lập (`.chrome_profile`)**: Không ảnh hưởng tới các profile Chrome cá nhân hay công việc đang dùng trên máy.
-- **Quản lý Project tự động**: Tự tạo và lưu Project trên Google Flow (`.flow_project.json`). Đồng thời cung cấp API để xem, đổi project hoặc tạo mới theo nhu cầu.
+- **Quản lý đa tài khoản Google**: Dễ dàng thêm, chuyển đổi tài khoản và bật/tắt dịch vụ qua giao diện Cài đặt trực quan (`http://localhost:8080`).
 
 ---
 
@@ -65,12 +66,13 @@ cd d:\Code_Carrer\ClaudeCer\CreateImg
 ### 1. Tạo ảnh (`POST /api/v1/generate`)
 
 #### Request:
-- **URL**: `http://localhost:8000/api/v1/generate`
+- **URL**: `http://localhost:8080/api/v1/generate`
 - **Method**: `POST`
 - **Headers**: `Content-Type: application/json`
 - **Body (Tạo kèm ảnh tham chiếu URL/Base64/File Path)**:
 ```json
 {
+  "app_name": "AppTruyenTranh",
   "items": [
     {
       "prompt": "Vẽ nhân vật anime theo phong cách tranh này",
