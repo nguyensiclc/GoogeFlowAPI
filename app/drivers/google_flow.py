@@ -223,7 +223,8 @@ class GoogleFlowDriver:
         1. Bấm dấu '+' ở thanh prompt
         2. Bấm vào 'Tải nội dung...'
         3. Chọn file ảnh từ image_path
-        4. Chờ ảnh tải lên và gắn vào prompt bar
+        4. Chờ ảnh tải lên và bấm nút 'Thêm vào câu lệnh' (Add to prompt)
+        5. Đảm bảo popup đã đóng và ảnh đã được đính kèm vào thanh prompt
         """
         logger.info("Đang nạp ảnh tham chiếu lên Flow: %s", image_path.name)
         if not image_path.exists():
@@ -269,14 +270,51 @@ class GoogleFlowDriver:
             else:
                 raise RuntimeError(f"Không thể upload ảnh tham chiếu '{image_path.name}' lên Flow: {exc}")
 
-        # 3. Chờ ảnh tải lên xong và xuất hiện trong thanh prompt
-        logger.info("Chờ ảnh tham chiếu tải lên xong...")
-        await page.wait_for_timeout(3_000)
+        # 3. Chờ ảnh tải lên và bấm nút 'Thêm vào câu lệnh'
+        logger.info("Chờ ảnh tải lên và nút 'Thêm vào câu lệnh' xuất hiện …")
+        add_btn_locators = [
+            page.locator("button:has-text('Thêm vào câu lệnh')").first,
+            page.locator("button:has-text('Add to prompt')").first,
+            page.locator("[aria-label*='Thêm vào câu lệnh' i]").first,
+            page.locator("text='Thêm vào câu lệnh'").first,
+        ]
+
+        inserted = False
+        for _ in range(25):  # Chờ tối đa 25 giây cho file upload xong
+            for btn_loc in add_btn_locators:
+                try:
+                    if await btn_loc.count() > 0 and await btn_loc.is_visible():
+                        is_disabled = await btn_loc.get_attribute("disabled")
+                        if is_disabled is None:
+                            logger.info("Bấm nút 'Thêm vào câu lệnh' …")
+                            await btn_loc.click()
+                            inserted = True
+                            break
+                except Exception:
+                    pass
+            if inserted:
+                break
+            await page.wait_for_timeout(1000)
+
+        if not inserted:
+            logger.warning("Không tìm thấy hoặc không click được nút 'Thêm vào câu lệnh', thử phím Enter …")
+            try:
+                await page.keyboard.press("Enter")
+            except Exception:
+                pass
+
+        await page.wait_for_timeout(1000)
+
+        # 4. Đảm bảo popup thư viện ảnh đã đóng lại
         try:
-            if await page.locator("text='Tất cả'").is_visible():
-                await page.keyboard.press("Escape")
+            dialog_close = page.locator("button:has-text('close'), button[aria-label*='Đóng' i]").first
+            if await dialog_close.count() > 0 and await dialog_close.is_visible():
+                await dialog_close.click()
+                await page.wait_for_timeout(500)
         except Exception:
             pass
+
+        logger.info("✅ Đã hoàn tất đính kèm ảnh tham chiếu: %s", image_path.name)
 
     # ── Media Tracking Helpers ────────────────────────────────────────────────
 
