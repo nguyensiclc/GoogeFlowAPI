@@ -5,6 +5,7 @@ chia sẻ chung một phiên trình duyệt Chrome (cùng session / context), qu
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -218,6 +219,13 @@ class ImageGeneratorService:
     # ── Image generation ─────────────────────────────────────────────────────
 
     async def generate_tasks(self, tasks: List[TaskItem]) -> List[GeneratedImage]:
+        """One browser, one operation at a time: generation and project deletion never overlap."""
+        if not hasattr(self, "_op_lock"):
+            self._op_lock = asyncio.Lock()
+        async with self._op_lock:
+            return await self._generate_tasks(tasks)
+
+    async def _generate_tasks(self, tasks: List[TaskItem]) -> List[GeneratedImage]:
         """Tạo ảnh tuần tự cho danh sách các TaskItem, tự động định tuyến đến Flow hoặc Gemini."""
         if not self.is_enabled:
             raise RuntimeError("Dịch vụ tạo ảnh đang tạm TẮT từ trang Cài đặt. Vui lòng bật lại.")
@@ -317,6 +325,14 @@ class ImageGeneratorService:
                         error=str(exc),
                     )
                 )
+                # Google refused ("unusual activity"): do not send the remaining prompts, every one would be refused
+                # too and keeps the account flagged. Mark them as not attempted.
+                if "FLOW_REFUSED" in str(exc):
+                    for rest in tasks[idx:]:
+                        results.append(GeneratedImage(prompt=rest.prompt, file_path=Path(""), provider=provider_target,
+                                                      error="FLOW_REFUSED: không gửi vì Google vừa từ chối ảnh trước"))
+                    logger.error("Dừng lô vì Google Flow báo hoạt động bất thường.")
+                    break
 
         return results
 
@@ -360,6 +376,25 @@ class ImageGeneratorService:
 
     def delete_project(self, app_name: str) -> bool:
         return ProjectStore.delete_project(app_name)
+
+    async def delete_flow_project(self, app_name: str) -> dict:
+        """Deletes the app's project on Flow itself (not only the link), then forgets the link."""
+        url = ProjectStore.get_project(app_name)
+        if not url:
+            return {"success": True, "had_project": False, "remote_deleted": False,
+                    "message": f"App '{app_name}' chưa có project trên Flow."}
+        if not hasattr(self, "_op_lock"):
+            self._op_lock = asyncio.Lock()
+        async with self._op_lock:
+            await self._ensure_session()
+            try:
+                await self._flow_driver.delete_project(url)
+            except Exception as exc:
+                logger.error("Không xoá được project Flow của [%s]: %s", app_name, exc)
+                return {"success": False, "had_project": True, "remote_deleted": False, "message": str(exc)}
+        ProjectStore.delete_project(app_name)
+        return {"success": True, "had_project": True, "remote_deleted": True,
+                "message": f"Đã xoá project Flow của '{app_name}'."}
 
     async def switch_project(self, project_url: str, app_name: str = "default") -> dict:
         if not self._flow_driver or not self._flow_driver._page:

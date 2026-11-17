@@ -512,9 +512,12 @@ async def list_projects(service=Depends(get_service)):
     return service.list_projects()
 
 
-@router.delete("/projects/{app_name}", summary="Xóa liên kết project của một ứng dụng")
-async def delete_app_project(app_name: str, service=Depends(get_service)):
-    """Xóa liên kết project của ứng dụng (lần gọi tiếp theo sẽ tự động sinh project mới trên Flow)."""
+@router.delete("/projects/{app_name}", summary="Xóa liên kết project của một ứng dụng (remote=true: xóa luôn trên Flow)")
+async def delete_app_project(app_name: str, remote: bool = False, service=Depends(get_service)):
+    """Xóa liên kết project của ứng dụng (lần gọi tiếp theo sẽ tự động sinh project mới trên Flow).
+    remote=true: xóa hẳn project đó trên flow.google.com (không hoàn tác được)."""
+    if remote:
+        return await service.delete_flow_project(app_name)
     success = service.delete_project(app_name)
     return {"success": success, "message": f"Đã xóa liên kết project cho app '{app_name}'."}
 

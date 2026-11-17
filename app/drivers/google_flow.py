@@ -363,8 +363,21 @@ class GoogleFlowDriver:
         2. Thẻ <img> đó đã tải xong hoàn toàn dữ liệu (img.complete === true VÀ img.naturalWidth > 0).
         """
         deadline = time.monotonic() + config.IMAGE_GENERATION_TIMEOUT
+        # Google sometimes refuses the generation ("unusual activity" / "hoạt động bất thường"). Count those notices
+        # now, so a NEW one means this request was refused: stop right away instead of waiting for the timeout.
+        # Nothing is retried or worked around here; the caller must stop and let the user wait.
+        refused_before = await self._count_refusals(page)
 
         while time.monotonic() < deadline:
+            if await self._count_refusals(page) > refused_before:
+                try:
+                    await page.screenshot(path=str(config.OUTPUT_DIR / "debug-flow-refused.png"))
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    "FLOW_REFUSED: Google Flow từ chối tạo ảnh vì 'hoạt động bất thường'. "
+                    "Hãy dừng tạo ảnh, đợi vài giờ rồi thử lại."
+                )
             # Kiểm tra xem có ảnh nào mới và đã load xong chưa
             new_image_found = await page.evaluate(
                 """(knownIds) => {
@@ -402,6 +415,20 @@ class GoogleFlowDriver:
             f"Quá thời gian ({config.IMAGE_GENERATION_TIMEOUT}s) mà không nhận được ảnh mới. "
             "Google Flow có thể đang quá tải hoặc gặp lỗi tạo ảnh."
         )
+
+    async def _count_refusals(self, page: Page) -> int:
+        """How many 'unusual activity' refusal notices the page shows (Vietnamese or English UI)."""
+        try:
+            return await page.evaluate(
+                """() => {
+                    const t = (document.body && document.body.innerText || '').toLowerCase();
+                    let n = 0;
+                    for (const k of ['hoạt động bất thường', 'unusual activity']) n += t.split(k).length - 1;
+                    return n;
+                }"""
+            )
+        except Exception:
+            return 0
 
     # ── Save image ───────────────────────────────────────────────────────────
 
@@ -544,6 +571,122 @@ class GoogleFlowDriver:
         project_url = page.url
         logger.info("Project mới được tạo: %s", project_url)
         return project_url
+
+    async def delete_project(self, project_url: str) -> bool:
+        """
+        Deletes a Flow project from the Flow home page: the project's card → its "more" menu → "Xóa"/"Delete" →
+        confirm. Returns True when the card is gone afterwards. On failure, saves a screenshot and the card's HTML
+        (debug-delete-*.png / .html in OUTPUT_DIR) and raises, so the selectors can be fixed.
+        """
+        page = self._page
+        if page is None or page.is_closed():
+            raise RuntimeError("Driver chưa được start.")
+        m = re.search(r"/project/([^/?#]+)", project_url or "")
+        if not m:
+            raise RuntimeError(f"URL project không hợp lệ: {project_url}")
+        pid = m.group(1)
+        card_link = f'a[href*="/project/{pid}"]'
+
+        await page.goto(config.FLOW_URL, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle", timeout=config.PAGE_LOAD_TIMEOUT * 1000)
+        link = page.locator(card_link).first
+        try:
+            await link.wait_for(state="attached", timeout=15_000)
+        except Exception:
+            logger.info("Không thấy project %s trên trang chủ Flow — coi như đã xoá.", pid)
+            return True
+        await link.scroll_into_view_if_needed()
+        await link.hover()
+        await page.wait_for_timeout(600)
+
+        # The card = nearest ancestor of the link that also holds a menu button.
+        card = link.locator("xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' project-card ')][1]")
+        if not await card.count():
+            card = link.locator("xpath=ancestor-or-self::*[.//button][1]")
+
+        # Flow (Nov 2026): the card footer has a trash button aria-label="Xoá dự án" (shown on hover).
+        direct = card.locator('button[aria-label*="Xoá dự án"], button[aria-label*="Xóa dự án"], '
+                              'button[aria-label*="Delete project"], button:has(mat-icon:text-is("delete"))').first
+        if await direct.count():
+            await card.hover()
+            await page.wait_for_timeout(300)
+            await direct.click(force=True)
+            await page.wait_for_timeout(700)
+            return await self._confirm_and_verify_delete(page, card_link, pid)
+
+        menu_btn = None
+        for sel in [
+            'button[aria-label*="Tùy chọn"]', 'button[aria-label*="tùy chọn"]', 'button[aria-label*="More"]',
+            'button[aria-label*="more"]', 'button[aria-label*="Options"]', 'button[aria-label*="Thêm"]',
+            'button:has-text("more_vert")', 'button:has-text("more_horiz")',
+        ]:
+            loc = card.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible(timeout=1_500):
+                    menu_btn = loc
+                    break
+            except Exception:
+                continue
+        if menu_btn is None:
+            await self._debug_delete(page, card, "no-menu")
+            raise RuntimeError("Không tìm thấy nút menu (⋮) của project trên trang chủ Flow.")
+        await menu_btn.click()
+        await page.wait_for_timeout(500)
+
+        delete_item = None
+        for sel in ['[role="menuitem"]:has-text("Xóa")', '[role="menuitem"]:has-text("Xoá")', '[role="menuitem"]:has-text("Delete")',
+                    'button:has-text("Xóa dự án")', 'button:has-text("Delete project")',
+                    '.cdk-overlay-pane button:has-text("Xóa")', '.cdk-overlay-pane button:has-text("Delete")']:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible(timeout=1_500):
+                    delete_item = loc
+                    break
+            except Exception:
+                continue
+        if delete_item is None:
+            await self._debug_delete(page, card, "no-delete-item")
+            await page.keyboard.press("Escape")
+            raise RuntimeError("Menu của project không có mục Xóa/Delete.")
+        await delete_item.click()
+        await page.wait_for_timeout(700)
+        return await self._confirm_and_verify_delete(page, card_link, pid)
+
+    async def _confirm_and_verify_delete(self, page: Page, card_link: str, pid: str) -> bool:
+        # Confirmation dialog (if any): the destructive button.
+        for sel in ['[role="dialog"] button:has-text("Xóa")', '[role="dialog"] button:has-text("Xoá")', '[role="dialog"] button:has-text("Delete")',
+                    '[role="alertdialog"] button:has-text("Xóa")', '[role="alertdialog"] button:has-text("Delete")',
+                    '.cdk-overlay-pane button:has-text("Xóa")', '.cdk-overlay-pane button:has-text("Delete")']:
+            loc = page.locator(sel).last
+            try:
+                if await loc.count() and await loc.is_visible(timeout=1_500):
+                    await loc.click()
+                    break
+            except Exception:
+                continue
+
+        # Done when the card is gone (reload once to be sure).
+        for _ in range(2):
+            try:
+                await page.locator(card_link).first.wait_for(state="detached", timeout=10_000)
+                logger.info("🗑 Đã xoá project Flow %s", pid)
+                return True
+            except Exception:
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+                if await page.locator(card_link).count() == 0:
+                    logger.info("🗑 Đã xoá project Flow %s", pid)
+                    return True
+        await self._debug_delete(page, page.locator(card_link).first, "still-there")
+        raise RuntimeError("Đã bấm xoá nhưng project vẫn còn trên trang chủ Flow.")
+
+    async def _debug_delete(self, page: Page, card, tag: str) -> None:
+        try:
+            await page.screenshot(path=str(config.OUTPUT_DIR / f"debug-delete-{tag}.png"))
+            html = await card.evaluate("el => el.outerHTML") if await card.count() else await page.content()
+            (config.OUTPUT_DIR / f"debug-delete-{tag}.html").write_text(html[:200_000], encoding="utf-8")
+        except Exception:
+            pass
 
     # ── Navigation ───────────────────────────────────────────────────────────
 
