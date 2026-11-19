@@ -174,6 +174,30 @@ class GoogleFlowDriver:
         if self._page is None:
             raise RuntimeError("Driver chưa được start.")
 
+        try:
+            return await self._generate_once(prompt, aspect_ratio, reference_images, app_name, project_url)
+        except RuntimeError as exc:
+            if "FLOW_REFUSED" not in str(exc):
+                raise
+        # Refused once: reload the Flow page (like pressing F5) a single time and send this picture again.
+        # A second refusal is final: the caller stops the batch and the user waits.
+        logger.warning("Flow báo 'hoạt động bất thường' — tải lại trang Flow (F5) rồi thử lại ảnh này 1 lần …")
+        try:
+            await self._page.reload(wait_until="domcontentloaded", timeout=60_000)
+        except Exception as reload_exc:
+            logger.warning("Tải lại trang lỗi: %s", reload_exc)
+        await self._page.wait_for_timeout(8_000)
+        self._aspect_for = None  # re-check the frame settings on the fresh page
+        return await self._generate_once(prompt, aspect_ratio, reference_images, app_name, project_url)
+
+    async def _generate_once(
+        self,
+        prompt: str,
+        aspect_ratio: Optional[str],
+        reference_images: Optional[List[Path]],
+        app_name: Optional[str],
+        project_url: Optional[str],
+    ) -> Path:
         page = self._page
         output_path = config.OUTPUT_DIR / f"{uuid.uuid4().hex}.png"
 
@@ -365,7 +389,7 @@ class GoogleFlowDriver:
         deadline = time.monotonic() + config.IMAGE_GENERATION_TIMEOUT
         # Google sometimes refuses the generation ("unusual activity" / "hoạt động bất thường"). Count those notices
         # now, so a NEW one means this request was refused: stop right away instead of waiting for the timeout.
-        # Nothing is retried or worked around here; the caller must stop and let the user wait.
+        # generate_image reloads the page once and retries; a second refusal stops the batch.
         refused_before = await self._count_refusals(page)
 
         while time.monotonic() < deadline:
