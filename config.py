@@ -27,6 +27,10 @@ CHROME_EXECUTABLE: str = os.getenv(
 # Giữ False để tránh bị Google block bot-detection.
 HEADLESS: bool = os.getenv("HEADLESS", "false").lower() == "true"
 
+# Số tab Flow tạo ảnh song song (mỗi tab một project Flow riêng). 1 = tuần tự như cũ.
+# Nhiều luồng hơn thì nhanh hơn nhưng dễ bị Google báo "hoạt động bất thường" hơn.
+FLOW_PARALLEL: int = max(1, int(os.getenv("FLOW_PARALLEL", "2")))
+
 # ─── Providers ──────────────────────────────────────────────────────────────────
 # Nhà cung cấp mặc định: "flow" (Google Flow) hoặc "gemini" (Gemini Chat)
 DEFAULT_PROVIDER: str = os.getenv("DEFAULT_PROVIDER", "flow").lower()

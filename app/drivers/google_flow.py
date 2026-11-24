@@ -88,7 +88,10 @@ class GoogleFlowDriver:
         self,
         user_data_dir: Optional[str] = None,
         context: Optional[BrowserContext] = None,
+        own_page: bool = False,
     ) -> None:
+        # own_page: extra parallel worker — always opens its own tab and skips the default project at start.
+        self._own_page = own_page
         self.user_data_dir: str = user_data_dir or config.CHROME_USER_DATA_DIR
         self._playwright: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = context
@@ -115,6 +118,11 @@ class GoogleFlowDriver:
                 ],
                 no_viewport=True,
             )
+
+        if self._own_page and (not self._page or self._page.is_closed()):
+            self._page = await self._context.new_page()
+            logger.info("Worker Flow: đã mở tab riêng.")
+            return
 
         if not self._page or self._page.is_closed():
             # Tìm xem có page nào đang mở Flow không
@@ -208,14 +216,35 @@ class GoogleFlowDriver:
         if aspect_ratio:
             await self._ensure_aspect(page, aspect_ratio)
 
-        # 2. Thu thập danh sách ID / URL các ảnh hiện có trước khi sinh ảnh mới
-        existing_ids = await self._get_existing_media_ids(page)
-        logger.info("Hiện có %d ảnh trong project trước khi submit.", len(existing_ids))
+        # 2. Ảnh tham chiếu: chọn lại từ thư viện của project nếu đã tải lên trước đó, chưa có thì mới tải lên.
+        # The previous picture in this tab timed out: it may still land in the gallery. Wait for it (up to 90 s)
+        # so it is never taken for THIS prompt's picture (that shifts every later scene by one).
+        late = getattr(self, "_late_from", None)
+        if late is not None:
+            self._late_from = None
+            for _ in range(90):
+                if await self._get_existing_media_ids(page) - late:
+                    logger.info("Ảnh trễ của lượt trước đã hiện — bỏ qua nó.")
+                    await page.wait_for_timeout(2_000)
+                    break
+                await page.wait_for_timeout(1_000)
 
-        # 2b. Nếu có ảnh tham chiếu, tải lên trước khi gõ prompt
+        before_refs = await self._get_existing_media_ids(page)
+        uploads = 0
         if reference_images:
             for ref_path in reference_images:
-                await self._upload_reference_image(page, ref_path)
+                if await self._attach_reference(page, ref_path):
+                    uploads += 1
+        if uploads:
+            # A fresh upload adds its own tile to the gallery: wait for it, so it is never taken for the new picture.
+            for _ in range(24):
+                if len(await self._get_existing_media_ids(page) - before_refs) >= uploads:
+                    break
+                await page.wait_for_timeout(500)
+
+        # 2b. Thu thập ID các ảnh hiện có (sau khi đính kèm, để ảnh tham chiếu không bị nhầm là ảnh mới tạo)
+        existing_ids = await self._get_existing_media_ids(page)
+        logger.info("Hiện có %d ảnh trong project trước khi submit.", len(existing_ids))
 
         # 3. Nhập prompt
         await self._type_prompt(page, prompt)
@@ -225,7 +254,11 @@ class GoogleFlowDriver:
 
         # 5. Chờ chính xác thời điểm ảnh mới hoàn thành (Network + DOM + Image Loaded)
         logger.info("Đang theo dõi tiến trình tạo ảnh (tối đa %ds) …", config.IMAGE_GENERATION_TIMEOUT)
-        new_img_locator = await self._wait_for_new_image(page, existing_ids)
+        try:
+            new_img_locator = await self._wait_for_new_image(page, existing_ids)
+        except TimeoutError:
+            self._late_from = existing_ids  # its picture may still arrive: the next prompt waits for it first
+            raise
 
         # 6. Lưu ảnh vừa tạo về disk
         await self._save_image_element(page, new_img_locator, output_path)
@@ -262,6 +295,55 @@ class GoogleFlowDriver:
             if await loc.is_visible():
                 return loc
         raise RuntimeError("Không tìm thấy nút '+' trên thanh prompt của Google Flow.")
+
+    async def _attach_reference(self, page: Page, image_path: Path) -> bool:
+        """
+        Đính kèm ảnh tham chiếu: chọn lại bản đã có trong thư viện (tìm theo tên file), chưa có thì tải lên 1 lần.
+        True khi phải tải lên (ảnh mới xuất hiện thêm một ô trong project).
+        """
+        try:
+            if await self._pick_from_library(page, image_path):
+                logger.info("♻ Dùng lại ảnh tham chiếu đã có trên Flow: %s", image_path.name)
+                return False
+        except Exception as exc:
+            logger.warning("Không chọn được ảnh từ thư viện (%s) — sẽ tải lên.", exc)
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+        logger.info("⬆ Ảnh tham chiếu chưa có trong project này — tải lên: %s", image_path.name)
+        await self._upload_reference_image(page, image_path)
+        return True
+
+    async def _pick_from_library(self, page: Page, image_path: Path) -> bool:
+        """Mở '+' → tìm tên file trong thư viện thành phần → bấm vào (Flow gắn ngay vào ô lệnh). False nếu chưa có."""
+        chips = page.locator("button.chip-container")
+        chips_before = await chips.count()
+        add_btn = await self._find_add_media_button(page)
+        await add_btn.click()
+        # The asset dialog's own search box (not the page's search bar at the top).
+        search = page.locator("input.search-input[aria-label*='Tìm kiếm thành phần' i],"
+                              " input.search-input[placeholder*='Tìm kiếm thành phần' i]").last
+        await search.wait_for(state="visible", timeout=8_000)
+        await search.fill(image_path.stem)
+        await page.wait_for_timeout(2_000)
+        item = page.locator("button.asset-item", has=page.locator(".asset-title", has_text=image_path.name)).first
+        if await item.count() == 0:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(700)
+            return False
+        await item.click()
+        add = page.locator("button:has-text('Thêm vào câu lệnh'), button:has-text('Add to prompt')").first
+        for _ in range(12):
+            await page.wait_for_timeout(500)
+            if await chips.count() > chips_before:  # attached straight away by the click
+                return True
+            if await add.count() > 0 and await add.is_visible() and await add.get_attribute("disabled") is None:
+                await add.click()
+                await page.wait_for_timeout(1_000)
+                return True
+        raise RuntimeError("đã chọn ảnh trong thư viện nhưng không thấy ảnh gắn vào ô lệnh")
 
     async def _upload_reference_image(self, page: Page, image_path: Path) -> None:
         """

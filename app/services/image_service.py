@@ -113,8 +113,8 @@ class ImageGeneratorService:
             return False
 
     async def _ensure_session(self, force: bool = False) -> None:
-        """Đảm bảo persistent context của Chrome và các driver đều đã sẵn sàng."""
-        if not force and self._is_session_alive() and self._flow_driver and self._gemini_driver:
+        """Đảm bảo persistent context của Chrome và tab Flow đã sẵn sàng (tab Gemini chỉ mở khi cần, xem _ensure_gemini)."""
+        if not force and self._is_session_alive() and self._flow_driver:
             return
 
         if self._context:
@@ -136,9 +136,14 @@ class ImageGeneratorService:
                 "--start-maximized",
                 f"--profile-directory={config.CHROME_PROFILE}",
                 "--disable-blink-features=AutomationControlled",
+                # parallel tabs: keep background tabs running at full speed
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
             ],
             no_viewport=True,
         )
+        self._extra_flow = []
 
         self._flow_driver = GoogleFlowDriver(context=self._context)
         try:
@@ -146,22 +151,32 @@ class ImageGeneratorService:
         except Exception as exc:
             logger.warning("Chưa thể khởi tạo tab Flow: %s", exc)
 
-        self._gemini_driver = GeminiChatDriver(context=self._context)
-        try:
+        # Tab Gemini không mở sẵn: chỉ mở khi có yêu cầu tạo ảnh bằng Gemini (_ensure_gemini).
+
+    async def _ensure_gemini(self) -> None:
+        """Mở tab Gemini Chat (lần đầu có yêu cầu dùng Gemini, hoặc khi tab đã bị đóng)."""
+        if not self._is_session_alive():
+            await self._ensure_session(force=True)
+        if not self._gemini_driver or not self._gemini_driver._page or self._gemini_driver._page.is_closed():
+            self._gemini_driver = GeminiChatDriver(context=self._context)
             await self._gemini_driver.start()
-        except Exception as exc:
-            logger.warning("Chưa thể khởi tạo tab Gemini: %s", exc)
 
     async def startup(self) -> None:
         logger.info("ImageGeneratorService khởi động (enabled=%s) …", self.is_enabled)
         try:
             await self._ensure_session()
             active_account = AccountManager.get_active_account()
-            logger.info("Dịch vụ đã sẵn sàng cho cả Flow và Gemini với tài khoản [%s]", active_account["name"])
+            logger.info("Dịch vụ đã sẵn sàng (Flow; Gemini mở khi cần) với tài khoản [%s]", active_account["name"])
         except Exception as exc:
             logger.warning("Chưa thể khởi chạy phiên Chrome lúc startup (có thể Chrome đang mở): %s", exc)
 
     async def shutdown(self) -> None:
+        for d in getattr(self, "_extra_flow", []) or []:
+            try:
+                await d.stop()
+            except Exception:
+                pass
+        self._extra_flow = []
         if self._flow_driver:
             await self._flow_driver.stop()
             self._flow_driver = None
@@ -232,6 +247,12 @@ class ImageGeneratorService:
 
         await self._ensure_session()
 
+        flow_only = all((t.provider or self.provider or config.DEFAULT_PROVIDER).strip().lower()
+                        not in ("gemini", "gemini_chat") for t in tasks)
+        workers = min(config.FLOW_PARALLEL, len(tasks))
+        if flow_only and workers > 1:
+            return await self._generate_parallel(tasks, workers)
+
         results: List[GeneratedImage] = []
         for idx, task in enumerate(tasks, 1):
             ref_info = f" (+ {len(task.reference_images)} ảnh tham chiếu)" if task.reference_images else ""
@@ -253,12 +274,7 @@ class ImageGeneratorService:
 
             try:
                 if is_gemini:
-                    if not self._gemini_driver or not self._gemini_driver._page or self._gemini_driver._page.is_closed():
-                        if not self._is_session_alive():
-                            await self._ensure_session(force=True)
-                        else:
-                            self._gemini_driver = GeminiChatDriver(context=self._context)
-                            await self._gemini_driver.start()
+                    await self._ensure_gemini()
 
                     path = await self._gemini_driver.generate_image(
                         prompt=task.prompt,
@@ -295,6 +311,7 @@ class ImageGeneratorService:
                     try:
                         await self._ensure_session(force=True)
                         if is_gemini:
+                            await self._ensure_gemini()
                             path = await self._gemini_driver.generate_image(
                                 prompt=task.prompt,
                                 aspect_ratio=task.aspect_ratio,
@@ -335,6 +352,82 @@ class ImageGeneratorService:
                     break
 
         return results
+
+    # ── Parallel Flow tabs ───────────────────────────────────────────────────
+
+    async def _flow_workers(self, n: int) -> List[GoogleFlowDriver]:
+        """The main Flow tab plus n-1 extra tabs (kept open between calls, reopened if closed)."""
+        if not self._flow_driver or not self._flow_driver._page or self._flow_driver._page.is_closed():
+            self._flow_driver = GoogleFlowDriver(context=self._context)
+            await self._flow_driver.start()
+        extra = getattr(self, "_extra_flow", None)
+        if extra is None:
+            extra = self._extra_flow = []
+        for i in range(n - 1):
+            d = extra[i] if i < len(extra) else None
+            if d is None or not d._page or d._page.is_closed():
+                d = GoogleFlowDriver(context=self._context, own_page=True)
+                await d.start()
+                if i < len(extra):
+                    extra[i] = d
+                else:
+                    extra.append(d)
+        return [self._flow_driver] + extra[: n - 1]
+
+    @staticmethod
+    def _worker_app(app_name: Optional[str], k: int) -> Optional[str]:
+        """Tab k > 0 works in its own Flow project ("<app>#w<k>"), so tabs never see each other's pictures."""
+        if k == 0:
+            return app_name
+        return f"{app_name or 'default'}#w{k}"
+
+    async def _generate_parallel(self, tasks: List[TaskItem], n: int) -> List[GeneratedImage]:
+        """
+        n Flow tabs take prompts from one queue. Every tab gets the same prompt text and the same reference images,
+        so the pictures stay consistent; each tab keeps its own project (and uploads each reference once there).
+        A refusal ("unusual activity") on any tab stops all tabs.
+        """
+        workers = await self._flow_workers(n)
+        logger.info("Tạo %d ảnh với %d tab Flow song song …", len(tasks), len(workers))
+        results: List[Optional[GeneratedImage]] = [None] * len(tasks)
+        queue: asyncio.Queue = asyncio.Queue()
+        for i, t in enumerate(tasks):
+            queue.put_nowait((i, t))
+        state = {"refused": False}
+
+        async def run(k: int, drv: GoogleFlowDriver) -> None:
+            await asyncio.sleep(k * 5)  # stagger the tabs: no burst of simultaneous requests
+            while True:
+                try:
+                    i, t = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                if state["refused"]:
+                    results[i] = GeneratedImage(prompt=t.prompt, file_path=Path(""), provider="flow",
+                                                error="FLOW_REFUSED: không gửi vì Google vừa từ chối ảnh trước")
+                    continue
+                logger.info("[tab %d] [%d/%d] Đang tạo: %s", k + 1, i + 1, len(tasks), t.prompt[:70])
+                try:
+                    path = await drv.generate_image(
+                        prompt=t.prompt,
+                        aspect_ratio=t.aspect_ratio,
+                        reference_images=t.reference_images,
+                        app_name=self._worker_app(t.app_name, k),
+                        project_url=t.project_url if k == 0 else None,
+                    )
+                    results[i] = GeneratedImage(prompt=t.prompt, file_path=path, provider="flow")
+                    self.total_generated += 1
+                    logger.info("[tab %d] ✓ %s", k + 1, path)
+                except Exception as exc:
+                    logger.error("[tab %d] ✗ %s", k + 1, exc)
+                    results[i] = GeneratedImage(prompt=t.prompt, file_path=Path(""), provider="flow", error=str(exc))
+                    if "FLOW_REFUSED" in str(exc):
+                        state["refused"] = True
+                        logger.error("Dừng mọi tab vì Google Flow báo hoạt động bất thường.")
+
+        await asyncio.gather(*(run(k, d) for k, d in enumerate(workers)))
+        return [r or GeneratedImage(prompt=t.prompt, file_path=Path(""), provider="flow", error="không chạy")
+                for r, t in zip(results, tasks)]
 
     async def generate(
         self,
@@ -378,7 +471,15 @@ class ImageGeneratorService:
         return ProjectStore.delete_project(app_name)
 
     async def delete_flow_project(self, app_name: str) -> dict:
-        """Deletes the app's project on Flow itself (not only the link), then forgets the link."""
+        """Deletes the app's project on Flow (and its parallel-tab projects "<app>#w<k>"), then forgets the links."""
+        extra = [k for k in ProjectStore.list_projects() if k.startswith(f"{app_name}#w")]
+        rs = [await self._delete_one_flow_project(k) for k in [app_name] + extra]
+        return {"success": all(r.get("success") for r in rs),
+                "had_project": any(r.get("had_project") for r in rs),
+                "remote_deleted": any(r.get("remote_deleted") for r in rs),
+                "message": " · ".join(r.get("message", "") for r in rs if r.get("message"))}
+
+    async def _delete_one_flow_project(self, app_name: str) -> dict:
         url = ProjectStore.get_project(app_name)
         if not url:
             return {"success": True, "had_project": False, "remote_deleted": False,

@@ -22,6 +22,8 @@ import config
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(),
+              logging.FileHandler(config.OUTPUT_DIR / "createimg.log", encoding="utf-8")],
 )
 logger = logging.getLogger(__name__)
 
